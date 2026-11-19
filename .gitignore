@@ -2,4 +2,4 @@ __pycache__/
 /desktop/build/
 graphify-out/
 AGENTS.md
-codex/
+.codex/
