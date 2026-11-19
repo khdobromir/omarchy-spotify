@@ -82,16 +82,16 @@ PopupCard {
     Timer {
       interval: 500
       repeat: true
-      running: root.open && !root.showingLibrary && root.hasProgress && root.sample.playing
+      running: root.open && !root.showingLibrary && root.hasProgress && root.sample.playing === true
       onTriggered: root.now = Date.now()
     }
 
     Timer {
       interval: 1
       running: root.open && !root.showingLibrary && root.hasTrack && root.extended
-        && root.ready && !root.spotify.busy && root.favoriteRequested !== root.sample.trackId
+        && root.ready && !root.spotify?.busy && root.favoriteRequested !== root.sample.trackId
       onTriggered: {
-        if (root.spotify.run("favorite", [root.sample.trackId]))
+        if (root.spotify?.run("favorite", [root.sample.trackId]))
           root.favoriteRequested = root.sample.trackId
       }
     }
@@ -316,7 +316,7 @@ PopupCard {
 
     Button {
       visible: !!root.spotify
-      enabled: visible && !root.spotify.openingDesktop
+      enabled: !!root.spotify && !root.spotify.openingDesktop
       text: strings.t("openDesktop")
       foreground: root.textColor
       focusable: true
