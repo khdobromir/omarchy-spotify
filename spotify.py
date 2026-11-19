@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 from tempfile import NamedTemporaryFile
@@ -84,6 +85,27 @@ def device_id(value):
     return value if isinstance(value, str) and re.fullmatch(r"[!-~]{1,256}", value) else ""
 
 
+def artwork(images):
+    variants = []
+    for image in images if isinstance(images, list) else []:
+        image = record(image)
+        url = image.get("url")
+        if not isinstance(url, str) or not re.fullmatch(
+                r"https://(?:i\.scdn\.co/image|image-cdn-(?:ak|fa)\.spotifycdn\.com/image|"
+                r"mosaic\.scdn\.co/(?:60|300|640))/[a-fA-F0-9]{1,200}", url):
+            continue
+        size = image.get("width") or image.get("height")
+        if size is None and url.startswith("https://mosaic.scdn.co/"):
+            size = int(url.split("/")[3])
+        variants.append((size if type(size) is int and size > 0 else 0, url))
+    if not variants:
+        return {}
+    high = max(variants, key=lambda variant: variant[0])
+    medium = min((variant for variant in variants if variant[0] >= 256),
+                 key=lambda variant: variant[0], default=high)
+    return {"art": medium[1], "artHigh": high[1]}
+
+
 def playback_sample(data):
     data = record(data)
     device = record(data.get("device"))
@@ -95,14 +117,6 @@ def playback_sample(data):
         return {"status": "idle"}
 
     album = record(track.get("album"))
-    images = album.get("images")
-    art = ""
-    if isinstance(images, list):
-        for image in images[:8]:
-            url = record(image).get("url")
-            if isinstance(url, str) and re.fullmatch(r"https://i\.scdn\.co/image/[a-fA-F0-9]{1,128}", url):
-                art = url
-                break
 
     duration = milliseconds(track.get("duration_ms"))
     progress = milliseconds(data.get("progress_ms"))
@@ -121,7 +135,7 @@ def playback_sample(data):
                      if device.get("is_restricted") is not True and device.get("is_active") is not False else ""),
         "disallows": [action for action in ("skipping_next", "skipping_prev", "pausing", "resuming", "seeking")
                       if disallows.get(action) is True],
-        "art": art,
+        "art": artwork(album.get("images")).get("art", ""),
         "url": f"https://open.spotify.com/track/{track_id}",
         "playing": data.get("is_playing") is True,
         "duration": duration,
@@ -129,26 +143,73 @@ def playback_sample(data):
     }
 
 
-def library_page(kind, offset, token):
-    singular = LIBRARY_TYPES[kind]
-    # Saved albums can include nested track pages, even when we only need their titles.
-    data = record(request_json(f"{API_URL}/me/{kind}?limit={PAGE_SIZE}&offset={offset}",
-                               token=token, limit=LIBRARY_RESPONSE_LIMIT))
+def library_item(item, kind, inherited_art=None):
+    identity, title = item_id(item.get("id")), label(item.get("name"))
+    if not identity or not title or item.get("is_local") is True:
+        return None
+    subtitle = artist_label(item)
+    if kind == "playlist":
+        subtitle = label(record(item.get("owner")).get("display_name")) or label(item.get("description"))
+    images = record(item.get("album")).get("images") if kind == "track" else item.get("images")
+    return {"title": title, "subtitle": subtitle, "uri": f"spotify:{kind}:{identity}",
+            "url": f"https://open.spotify.com/{kind}/{identity}",
+            "duration": milliseconds(item.get("duration_ms")),
+            **(artwork(images) or inherited_art or {})}
+
+
+def page_items(data):
     entries = data.get("items")
     if not isinstance(entries, list):
         raise ValueError("Invalid library response")
-    items = []
-    for entry in entries[:PAGE_SIZE]:
-        item = record(entry) if kind == "playlists" else record(record(entry).get(singular))
-        identity, title = item_id(item.get("id")), label(item.get("name"))
-        if identity and title:
-            subtitle = label(record(item.get("owner")).get("display_name")) if kind == "playlists" else artist_label(item)
-            items.append({"title": title, "subtitle": subtitle,
-                          "uri": f"spotify:{singular}:{identity}",
-                          "url": f"https://open.spotify.com/{singular}/{identity}"})
+    return [record(entry) for entry in entries[:PAGE_SIZE]]
+
+
+def page_result(data, items, offset):
     next_offset = offset + PAGE_SIZE
-    return {"status": "ok", "items": items,
+    return {"status": "ok", "items": [item for item in items if item],
             "next": next_offset if data.get("next") and next_offset <= MAX_OFFSET else None}
+
+
+def library_page(kind, offset, token):
+    singular = LIBRARY_TYPES[kind]
+    data = record(request_json(f"{API_URL}/me/{kind}?limit={PAGE_SIZE}&offset={offset}",
+                               token=token, limit=LIBRARY_RESPONSE_LIMIT))
+    return page_result(data, (library_item(entry if singular == "playlist" else record(entry.get(singular)),
+                                           singular) for entry in page_items(data)), offset)
+
+
+def collection_page(kind, identity, offset, token):
+    base = f"{API_URL}/{kind}s/{identity}"
+    playlist = kind == "playlist"
+    fields = "?fields=id,name,description,owner(display_name),images" if playlist else ""
+    item = record(request_json(base + fields, token=token, limit=LIBRARY_RESPONSE_LIMIT))
+    collection = library_item(item, kind)
+    if not collection:
+        raise ValueError("Invalid collection metadata")
+    embedded = record(item.get("tracks")) if not playlist else {}
+    entries = embedded.get("items")
+    end = offset + PAGE_SIZE
+    if isinstance(entries, list) and (end <= len(entries) or (offset <= len(entries) and not embedded.get("next"))):
+        data = {"items": entries[offset:end], "next": end < len(entries) or bool(embedded.get("next"))}
+    else:
+        query = f"?limit={PAGE_SIZE}&offset={offset}"
+        try:
+            data = record(request_json(base + ("/items" if playlist else "/tracks") + query,
+                                       token=token, limit=LIBRARY_RESPONSE_LIMIT))
+        except HTTPError as error:
+            if playlist and error.code == 403:
+                error.close()
+                return {"status": "collection_forbidden", "collection": collection}
+            if not playlist or error.code != 404:
+                raise
+            error.close()
+            data = record(request_json(base + "/tracks" + query, token=token, limit=LIBRARY_RESPONSE_LIMIT))
+    art = artwork(item.get("images")) if not playlist else None
+    tracks = (record(entry.get("item", entry.get("track"))) if playlist else entry
+              for entry in page_items(data))
+    items = (library_item(track, track.get("type") or "track", art)
+             for track in tracks if track.get("type") in (None, "track", "episode"))
+    return {**page_result(data, items, offset), "collection": collection}
 
 
 def perform(command, args, token):
@@ -158,6 +219,13 @@ def perform(command, args, token):
         offset = int(args[1])
         if offset <= MAX_OFFSET:
             return library_page(args[0], offset, token)
+    if command == "collection" and len(args) == 2 and re.fullmatch(r"[0-9]{1,6}", args[1]):
+        match = re.fullmatch(r"spotify:(album|playlist):([a-zA-Z0-9]{22})", args[0])
+        if match and int(args[1]) <= MAX_OFFSET:
+            return collection_page(*match.groups(), int(args[1]), token)
+    if command == "track" and len(args) == 1 and item_id(args[0]):
+        track = library_item(record(request_json(f"{API_URL}/tracks/{args[0]}", token=token)), "track")
+        return {"status": "ok", "track": track} if track else {"status": "unavailable"}
     if command in ("favorite", "save", "remove") and len(args) == 1 and item_id(args[0]):
         query = "?" + urlencode({"uris": "spotify:track:" + args[0]})
         url = API_URL + "/me/library"
@@ -406,13 +474,32 @@ def http_failure(error):
         return {"status": "unavailable", "retry": 30}
 
 
+def launch_desktop(args):
+    if len(args) > 1 or (args and not re.fullmatch(r"spotify:(track|album|playlist):[a-zA-Z0-9]{22}", args[0])):
+        return {"status": "desktop_failed"}
+    executable = shutil.which("omarchy-spotify") or shutil.which(str(Path.home() / ".local/bin/omarchy-spotify"))
+    if not executable:
+        return {"status": "desktop_missing"}
+    try:
+        player = subprocess.Popen([executable, *args], stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                  start_new_session=True)
+        if player.wait(timeout=0.5) != 0:
+            return {"status": "desktop_failed"}
+    except subprocess.TimeoutExpired:
+        pass
+    return {"status": "ok"}
+
+
 def main(command, *args):
     try:
+        if command == "desktop":
+            return launch_desktop(args)
         if command == "disconnect":
             with token_lock():
                 TOKEN_FILE.unlink(missing_ok=True)
             return {"status": "disconnected"}
-        elif command not in ("connect", "status", "library", "favorite", "save", "remove") and command not in PLAYER_METHODS:
+        elif command not in ("connect", "status", "library", "collection", "track", "favorite", "save", "remove") and command not in PLAYER_METHODS:
             raise ValueError("Unknown command")
         client_id = load_client_id()
         if client_id is None:
@@ -424,6 +511,8 @@ def main(command, *args):
             return {"status": "no_device" if error.code == 404 else "action_forbidden"}
         return http_failure(error)
     except (OSError, ValueError, KeyError, TypeError):
+        if command == "desktop":
+            return {"status": "desktop_failed"}
         if command == "status":
             return {"status": "unavailable", "retry": 30}
         if command == "connect":

@@ -77,6 +77,58 @@ class SpotifyTests(unittest.TestCase):
                 request.assert_called_once_with(spotify.API_URL + "/me/" + kind + "?limit=20&offset=20",
                                                 token="test", limit=spotify.LIBRARY_RESPONSE_LIMIT)
 
+    def test_playlist_tracks_keep_their_own_art_and_order(self):
+        playlist = "spotify:playlist:" + "p" * 22
+        track = {"id": "t" * 22, "type": "track", "name": "Song", "duration_ms": 120000,
+                 "album": {"images": [{"width": 64, "url": "https://i.scdn.co/image/aaa"},
+                                      {"width": 640, "url": "https://i.scdn.co/image/ccc"},
+                                      {"width": 300, "url": "https://i.scdn.co/image/bbb"}]}}
+        with patch.object(spotify, "request_json", side_effect=[
+            {"id": "p" * 22, "name": "Playlist", "owner": {"display_name": "Owner"}},
+            {"items": [{"item": None}, {"item": track}, {"track": dict(track, name="Second")}],
+             "next": "https://example.invalid"},
+        ]) as request:
+            result = spotify.perform("collection", (playlist, "20"), "test")
+        self.assertEqual(result["collection"]["subtitle"], "Owner")
+        self.assertEqual([item["title"] for item in result["items"]], ["Song", "Second"])
+        self.assertEqual(result["items"][0]["art"], "https://i.scdn.co/image/bbb")
+        self.assertEqual(result["items"][0]["artHigh"], "https://i.scdn.co/image/ccc")
+        self.assertEqual(result["items"][0]["duration"], 120000)
+        self.assertEqual(result["next"], 40)
+        self.assertEqual(request.call_args.args[0],
+                         spotify.API_URL + "/playlists/" + "p" * 22 + "/items?limit=20&offset=20")
+
+    def test_album_tracks_inherit_album_art(self):
+        uri = "spotify:album:" + "a" * 22
+        art = "https://i.scdn.co/image/abc"
+        with patch.object(spotify, "request_json", return_value={
+            "id": "a" * 22, "name": "Album", "images": [{"width": 640, "url": art}],
+            "tracks": {"items": [{"id": "t" * 22, "name": "First"}, {"id": "u" * 22, "name": "Second"}]},
+        }) as request:
+            result = spotify.perform("collection", (uri, "0"), "test")
+        self.assertEqual([item["title"] for item in result["items"]], ["First", "Second"])
+        self.assertEqual(result["items"][0]["art"], art)
+        request.assert_called_once()
+
+    def test_widget_launch_uses_an_argument_vector_without_oauth(self):
+        uri = "spotify:album:" + "a" * 22
+        with patch.object(spotify.shutil, "which", return_value="/test/omarchy-spotify"), patch.object(
+            spotify.subprocess, "Popen"
+        ) as start, patch.object(spotify, "load_client_id") as client_id:
+            start.return_value.wait.return_value = 0
+            self.assertEqual(spotify.main("desktop", uri), {"status": "ok"})
+            self.assertEqual(start.call_args.args[0], ["/test/omarchy-spotify", uri])
+            self.assertNotIn("shell", start.call_args.kwargs)
+            self.assertEqual(spotify.main("desktop", uri + "\n"), {"status": "desktop_failed"})
+            self.assertEqual(start.call_count, 1)
+            client_id.assert_not_called()
+
+    def test_invalid_collection_uri_makes_no_api_call(self):
+        with patch.object(spotify, "request_json") as request:
+            result = spotify.perform("collection", ("spotify:album:../../", "0"), "test")
+        self.assertEqual(result, {"status": "action_failed"})
+        request.assert_not_called()
+
     def test_refresh_preserves_new_permissions_when_scope_is_omitted(self):
         with TemporaryDirectory() as folder, patch.object(
             spotify, "TOKEN_FILE", Path(folder) / "tokens.json"
