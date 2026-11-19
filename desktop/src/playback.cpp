@@ -20,7 +20,7 @@ int milliseconds(const QJsonValue &value) {
 }
 
 bool Playback::playableUri(const QString &uri) {
-    static const QRegularExpression pattern(R"(^spotify:(track|album|playlist|episode):[a-zA-Z0-9]{22}$)");
+    static const QRegularExpression pattern(R"(\Aspotify:(track|album|playlist|episode):[a-zA-Z0-9]{22}\z)");
     return pattern.match(uri).hasMatch();
 }
 
@@ -29,7 +29,8 @@ void Playback::setItem(const QJsonObject &item) {
     const QString identifier = item.value("uri").toString();
     uri = playableUri(identifier) ? identifier : QString{};
     title = name(details);
-    album = name(details.value("parent").toObject().value("entity").toObject().value("decorations").toObject());
+    const QJsonObject parent = details.value("parent").toObject().value("entity").toObject().value("decorations").toObject();
+    album = name(parent);
     duration = milliseconds(details.value("playback").toObject().value("duration_ms"));
     QStringList creators;
     for (const QJsonValue &creator : details.value("creators").toArray()) {
@@ -41,12 +42,27 @@ void Playback::setItem(const QJsonObject &item) {
     }
     artist = creators.join(", ");
     art.clear();
-    static const QRegularExpression coverPattern(R"(^https://i\.scdn\.co/image/[a-fA-F0-9]{1,128}$)");
-    for (const QJsonValue &cover : details.value("visual_identity").toObject().value("cover").toArray()) {
-        const QString url = cover.toObject().value("url").toString();
-        if (coverPattern.match(url).hasMatch()) {
-            art = QUrl(url);
-            break;
+    artHigh.clear();
+    int largest = -1;
+    int nearest = -1;
+    static const QRegularExpression coverPattern(R"(\Ahttps://i\.scdn\.co/image/[a-fA-F0-9]{1,128}\z)");
+    const QStringList sizes{"small", "default", "large", "xlarge"};
+    for (const auto &entity : {details, parent}) {
+        for (const QJsonValue &cover : entity.value("visual_identity").toObject().value("cover").toArray()) {
+            const QJsonObject image = cover.toObject();
+            const QString url = image.value("url").toString();
+            if (!coverPattern.match(url).hasMatch())
+                continue;
+            const int size = int(sizes.indexOf(image.value("size").toString())) + 1;
+            if (size > largest) {
+                largest = size;
+                artHigh = QUrl(url);
+            }
+            const int fit = size >= 2 ? 6 - size : size;
+            if (fit > nearest) {
+                nearest = fit;
+                art = QUrl(url);
+            }
         }
     }
 }

@@ -13,6 +13,7 @@ struct Playback {
     QString artist;
     QString album;
     QUrl art;
+    QUrl artHigh;
     int duration = 0;
 
     bool apply(const QByteArray &line, qint64 now);

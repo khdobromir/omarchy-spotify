@@ -43,5 +43,8 @@
   "limited": "Spotify paused updates due to its rate limit.",
   "quota": "The Spotify developer quota has been reached. Updates will resume automatically.",
   "authorized": "Connected to Spotify.",
-  "track": ""
+  "track": "",
+  "openDesktop": "Open desktop player",
+  "desktop_missing": "Install the Omarchy Spotify desktop player first.",
+  "desktop_failed": "Could not open the desktop player."
 }

@@ -6,4 +6,5 @@ Comment[ru]=Медиатека и воспроизведение Spotify на э
 Exec=omarchy-spotify
 Icon=multimedia-player
 Terminal=false
+StartupNotify=true
 Categories=AudioVideo;Audio;Player;

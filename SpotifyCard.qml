@@ -302,6 +302,23 @@ PopupCard {
     }
 
     PlainLabel {
+      visible: !!root.spotify?.desktopNotice
+      text: visible ? strings.t(root.spotify.desktopNotice) : ""
+      font.pixelSize: Style.space(12)
+      wrapMode: Text.WordWrap
+      Layout.fillWidth: true
+    }
+
+    Button {
+      visible: !!root.spotify
+      enabled: visible && !root.spotify.openingDesktop
+      text: strings.t("openDesktop")
+      foreground: root.textColor
+      focusable: true
+      onClicked: root.spotify.openDesktop("")
+    }
+
+    PlainLabel {
       readonly property string notice: root.spotify?.notice ?? ""
       visible: (root.connecting && root.hasTrack) || (!!notice && notice !== root.sample.status)
       font.pixelSize: Style.font.bodySmall

@@ -34,6 +34,21 @@ private slots:
         QVERIFY(Playback::playableUri("spotify:playlist:aaaaaaaaaaaaaaaaaaaaaa"));
         QVERIFY(!Playback::playableUri("spotify:artist:aaaaaaaaaaaaaaaaaaaaaa"));
     }
+
+    void coverSizeIsChosenAcrossTrackAndAlbum() {
+        Playback playback;
+        const QByteArray event = "1 {\"type\":\"track_changed\",\"item\":{\"decorations\":{"
+            "\"visual_identity\":{\"cover\":["
+            "{\"url\":\"https://i.scdn.co/image/111\",\"size\":\"small\"},"
+            "{\"url\":\"https://i.scdn.co/image/333\",\"size\":\"large\"},"
+            "{\"url\":\"https://i.scdn.co/image/222\",\"size\":\"default\"}]},"
+            "\"parent\":{\"entity\":{\"decorations\":{\"visual_identity\":{\"cover\":["
+            "{\"url\":\"https://i.scdn.co/image/444\",\"size\":\"xlarge\"}]}}}}"
+            "}}}";
+        QVERIFY(playback.apply(event, 0));
+        QCOMPARE(playback.art, QUrl("https://i.scdn.co/image/222"));
+        QCOMPARE(playback.artHigh, QUrl("https://i.scdn.co/image/444"));
+    }
 };
 
 QTEST_GUILESS_MAIN(PlaybackTest)

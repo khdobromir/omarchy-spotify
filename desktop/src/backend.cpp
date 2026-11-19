@@ -8,6 +8,8 @@
 #include <QStandardPaths>
 
 #include <algorithm>
+#include <chrono>
+#include <utility>
 
 namespace {
 QByteArray readSmall(const QString &path, qint64 limit = 8192) {
@@ -70,14 +72,12 @@ Backend::Backend(QObject *parent)
     });
     connect(&m_control, &QProcess::stateChanged, this, &Backend::playerChanged);
     connect(&m_control, &QProcess::finished, this, [this](int code, QProcess::ExitStatus status) {
-        if (code != 0 || status != QProcess::NormalExit)
-            setPlayerStatus("player_command");
+        controlFinished(code == 0 && status == QProcess::NormalExit);
     });
     connect(&m_control, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
         if (error == QProcess::FailedToStart)
-            setPlayerStatus("player_command");
+            controlFinished(false);
     });
-    connect(&m_web, &QProcess::stateChanged, this, &Backend::libraryChanged);
     connect(&m_web, &QProcess::finished, this, [this](int, QProcess::ExitStatus) {
         const QJsonDocument response = QJsonDocument::fromJson(m_web.readAllStandardOutput());
         webFinished(response.isObject() ? response.object() : QJsonObject{});
@@ -95,7 +95,7 @@ Backend::Backend(QObject *parent)
     }
     QTimer::singleShot(0, this, [this] {
         startPlayer();
-        loadLibrary("tracks", 0);
+        loadPending();
     });
 }
 
@@ -115,7 +115,7 @@ Backend::~Backend() {
 QVariantMap Backend::playback() const {
     return {{"ready", m_playback.loggedIn}, {"playing", m_playback.status == "playing"},
             {"uri", m_playback.uri}, {"title", m_playback.title}, {"artist", m_playback.artist}, {"album", m_playback.album},
-            {"art", m_playback.art}, {"duration", m_playback.duration}};
+            {"art", m_playback.art}, {"artHigh", m_playback.artHigh}, {"duration", m_playback.duration}};
 }
 
 int Backend::position() const {
@@ -212,6 +212,12 @@ void Backend::readTrace() {
     }
     emit playbackChanged();
     emit positionChanged();
+    if (!m_selectedUri.isEmpty() && m_playback.uri == m_selectedUri && m_pendingPlay.isEmpty()) {
+        m_selectionStatus.clear();
+        m_lookupSelection = false;
+        emit playerChanged();
+    }
+    playPending();
     checkFavorite();
 }
 
@@ -239,8 +245,77 @@ void Backend::command(const QStringList &args) {
 void Backend::play(const QString &uri) {
     if (uri.isEmpty())
         command({"play"});
-    else if (Playback::playableUri(uri))
-        command({"play", uri});
+    else if (Playback::playableUri(uri)) {
+        m_selectedUri = m_pendingPlay = uri;
+        m_selection.clear();
+        m_lookupSelection = false;
+        updateSelection();
+        m_selectionStatus = "waiting";
+        emit playerChanged();
+        playPending();
+    }
+}
+
+void Backend::openUri(const QString &uri) {
+    if (!Playback::playableUri(uri))
+        return;
+    if (uri.startsWith("spotify:album:") || uri.startsWith("spotify:playlist:")) {
+        openCollection(uri);
+    } else {
+        if (m_category != "tracks" || !m_collectionUri.isEmpty())
+            loadLibrary("tracks", 0);
+        play(uri);
+        if (uri.startsWith("spotify:track:") && m_selection.isEmpty() && m_selectionStatus != "") {
+            m_lookupSelection = true;
+            loadPending();
+        }
+    }
+}
+
+void Backend::playPending() {
+    if (m_pendingPlay.isEmpty() || commandBusy() || !m_playback.loggedIn)
+        return;
+    m_activePlay = std::exchange(m_pendingPlay, {});
+    m_selectionStatus = "sent";
+    emit playerChanged();
+    command({"play", m_activePlay});
+}
+
+void Backend::controlFinished(bool success) {
+    if (!success) {
+        setPlayerStatus("player_command");
+        if (!m_activePlay.isEmpty() && m_activePlay == m_selectedUri && m_pendingPlay.isEmpty())
+            m_selectionStatus = "failed";
+    } else if (m_activePlay == m_selectedUri && m_pendingPlay.isEmpty()) {
+        m_selectionStatus.clear();
+    }
+    m_activePlay.clear();
+    emit playerChanged();
+    playPending();
+}
+
+void Backend::dismissSelection() {
+    m_pendingPlay.clear();
+    m_selectedUri.clear();
+    m_selectionStatus.clear();
+    m_lookupSelection = false;
+    m_selection.clear();
+    emit selectionChanged();
+    emit playerChanged();
+}
+
+void Backend::updateSelection() {
+    if (m_selectedUri == m_collectionUri)
+        m_selection = m_collection;
+    for (const QVariant &entry : m_entries) {
+        const QVariantMap metadata = entry.toMap();
+        if (metadata.value("uri") == m_selectedUri) {
+            m_selection = metadata;
+            m_lookupSelection = false;
+            break;
+        }
+    }
+    emit selectionChanged();
 }
 
 void Backend::togglePlayback() {
@@ -270,20 +345,100 @@ bool Backend::webRequest(const QString &operation, const QStringList &args) {
     m_webOperation = operation;
     m_webArguments = args;
     m_web.start("python3", QStringList{"-B", m_helper.fileName(), operation} + args);
+    emit libraryChanged();
     return true;
 }
 
 void Backend::loadLibrary(const QString &kind, int page) {
     if (kind != "tracks" && kind != "albums" && kind != "playlists")
         return;
-    if (webRequest("library", {kind, QString::number(page)})) {
-        m_category = kind;
-        m_offset = page;
-        m_nextOffset = -1;
-        m_entries.clear();
-        m_libraryStatus = "loading";
+    m_collectionUri.clear();
+    m_collection.clear();
+    m_category = kind;
+    navigate(page);
+}
+
+void Backend::openCollection(const QString &uri, const QVariantMap &metadata) {
+    if (!Playback::playableUri(uri))
+        return;
+    const bool album = uri.startsWith("spotify:album:");
+    if (!album && !uri.startsWith("spotify:playlist:"))
+        return;
+    if (m_collectionUri == uri && m_offset == 0 && m_libraryStatus == "ok")
+        return;
+    const QString category = album ? "albums" : "playlists";
+    if (m_category != category)
+        m_rootOffset = 0;
+    m_category = category;
+    m_collectionUri = uri;
+    m_collection = metadata;
+    navigate(0);
+}
+
+void Backend::back() {
+    if (!m_collectionUri.isEmpty())
+        loadLibrary(m_category, m_rootOffset);
+}
+
+void Backend::loadPage(int offset) {
+    navigate(offset);
+}
+
+void Backend::retryLibrary() {
+    navigate(m_offset, true);
+}
+
+QString Backend::pageKey() const {
+    return (m_collectionUri.isEmpty() ? m_category : m_collectionUri) + '/' + QString::number(m_offset);
+}
+
+void Backend::navigate(int offset, bool refresh) {
+    if (offset < 0 || offset > 100'000 || offset % 20 != 0)
+        return;
+    m_offset = offset;
+    if (m_collectionUri.isEmpty())
+        m_rootOffset = offset;
+    const QString key = pageKey();
+    if (const auto *cached = m_pages.object(key); !refresh && cached && !cached->expires.hasExpired()) {
+        m_loadPending = false;
+        applyPage(cached->data);
+        return;
+    }
+    m_pages.remove(key);
+    m_loadPending = true;
+    m_nextOffset = -1;
+    m_entries.clear();
+    m_libraryStatus = "loading";
+    emit libraryChanged();
+    emit entriesChanged();
+    loadPending();
+}
+
+void Backend::applyPage(const QJsonObject &result) {
+    m_libraryStatus = result.value("status").toString("unavailable");
+    m_entries = result.value("items").toArray().toVariantList();
+    m_nextOffset = result.value("next").toInt(-1);
+    if (result.value("collection").isObject())
+        m_collection = result.value("collection").toObject().toVariantMap();
+    updateSelection();
+    emit libraryChanged();
+    emit entriesChanged();
+}
+
+void Backend::loadPending() {
+    if (m_loadPending) {
+        if (webBusy())
+            return;
+        const bool detail = !m_collectionUri.isEmpty();
+        m_loadPending = false;
+        if (webRequest(detail ? "collection" : "library",
+                       {detail ? m_collectionUri : m_category, QString::number(m_offset)}))
+            return;
+        m_libraryStatus = m_backoff.hasExpired() ? "unavailable" : "limited";
         emit libraryChanged();
     }
+    if (m_lookupSelection && webRequest("track", {m_selectedUri.mid(14)}))
+        m_lookupSelection = false;
 }
 
 void Backend::connectLibrary() {
@@ -307,27 +462,49 @@ void Backend::checkFavorite() {
 }
 
 void Backend::webFinished(const QJsonObject &result) {
+    const QString operation = std::exchange(m_webOperation, {});
+    const QStringList arguments = std::exchange(m_webArguments, {});
     const QString status = result.value("status").toString("unavailable");
+    if (status == "disconnected" || status == "reauthorize")
+        m_pages.clear();
     const qint64 retry = result.value("retry").toInteger();
     if (retry > 0)
         m_backoff = QDeadlineTimer(std::min(retry, qint64{86400}) * 1000);
-    if (m_webOperation == "library") {
-        m_libraryStatus = status;
-        m_entries = result.value("items").toArray().toVariantList();
-        m_nextOffset = result.value("next").toInt(-1);
-    } else if (m_webOperation == "connect") {
-        m_libraryStatus = status;
+    if (operation == "library" || operation == "collection") {
+        const QString key = arguments.value(0) + '/' + arguments.value(1);
+        if (status == "ok")
+            m_pages.insert(key, new LibraryPage{QDeadlineTimer(std::chrono::minutes(3)), result});
+        if (key == pageKey()) {
+            m_loadPending = false;
+            applyPage(result);
+        }
+    } else if (operation == "track") {
+        const QVariantMap metadata = result.value("track").toObject().toVariantMap();
+        if (metadata.value("uri") == m_selectedUri) {
+            m_selection = metadata;
+            emit selectionChanged();
+        }
+    } else if (operation == "connect") {
         if (status == "authorized") {
             m_checkedTrack.clear();
-            loadLibrary(m_category, 0);
+            m_pages.clear();
+            navigate(m_offset);
+        } else if (!m_loadPending) {
+            m_libraryStatus = status;
         }
-    } else if (status == "ok" && m_webArguments.value(0) == trackId(m_playback)) {
-        m_favorite = result.value("saved").toBool() ? 1 : 0;
-        if (m_webOperation != "favorite" && m_category == "tracks")
-            loadLibrary(m_category, m_offset);
-    } else if (status != "ok" && m_webOperation != "favorite") {
-        m_libraryStatus = status;
+    } else if (status == "ok") {
+        if (arguments.value(0) == trackId(m_playback))
+            m_favorite = result.value("saved").toBool() ? 1 : 0;
+        if (operation == "save" || operation == "remove") {
+            m_pages.clear();
+            if (m_category == "tracks" && m_collectionUri.isEmpty())
+                navigate(m_offset);
+        }
+    } else if (operation == "save" || operation == "remove") {
+        if (!m_loadPending)
+            m_libraryStatus = status;
     }
     emit libraryChanged();
+    loadPending();
     checkFavorite();
 }

@@ -3,6 +3,9 @@
 #include <QKeySequence>
 #include <QLockFile>
 #include <QDir>
+#include <QNetworkAccessManager>
+#include <QNetworkDiskCache>
+#include <QQmlNetworkAccessManagerFactory>
 #include <QQmlApplicationEngine>
 #include <QQuickStyle>
 #include <QQuickWindow>
@@ -11,8 +14,23 @@
 #include <QUrl>
 
 #include "backend.h"
+#include "instance.h"
+#include "window.h"
 #include "theme.h"
 #include "translator.h"
+
+namespace {
+class ArtworkNetwork : public QQmlNetworkAccessManagerFactory {
+    QNetworkAccessManager *create(QObject *parent) override {
+        auto *network = new QNetworkAccessManager(parent);
+        auto *cache = new QNetworkDiskCache(network);
+        cache->setCacheDirectory(QStandardPaths::writableLocation(QStandardPaths::CacheLocation) + "/artwork");
+        cache->setMaximumCacheSize(64 * 1024 * 1024);
+        network->setCache(cache);
+        return network;
+    }
+};
+}
 
 int main(int argc, char *argv[]) {
     QGuiApplication app(argc, argv);
@@ -21,10 +39,22 @@ int main(int argc, char *argv[]) {
 
     app.setDesktopFileName("omarchy-spotify");
     app.setWindowIcon(QIcon::fromTheme("multimedia-player"));
+    const auto args = app.arguments();
+    const QString uri = args.value(1);
+    if (args.size() > 2 || (args.size() == 2 && (uri.isEmpty() || !Instance::validRequest(uri)))) {
+        qWarning("Usage: omarchy-spotify [spotify:track|album|playlist:ID]");
+        return 2;
+    }
+
     const QDir runtime(QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation));
-    QLockFile instance(runtime.filePath("omarchy-spotify.lock"));
-    if (!instance.tryLock(0))
-        return 0;
+    const QString socket = runtime.filePath("omarchy-spotify.sock");
+    QLockFile lock(runtime.filePath("omarchy-spotify.lock"));
+    if (!lock.tryLock(0)) {
+        if (lock.error() == QLockFile::LockFailedError && Instance::forward(socket, uri))
+            return 0;
+        qWarning("Could not contact the running Omarchy Spotify instance");
+        return 1;
+    }
 
     QQuickStyle::setStyle("Material");
 
@@ -35,13 +65,32 @@ int main(int argc, char *argv[]) {
 
     Theme theme;
     Backend backend;
+    ArtworkNetwork artwork;
 
     QQmlApplicationEngine engine;
+    engine.setNetworkAccessManagerFactory(&artwork);
     QObject::connect(&translator, &Translator::changed, &engine, &QQmlEngine::retranslate);
-    engine.setInitialProperties({{"theme", QVariant::fromValue(&theme)}, {"backend", QVariant::fromValue(&backend)}});
+    const auto preferences = QDir(QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation))
+        .filePath("omarchy-spotify/preferences.ini");
+    engine.setInitialProperties({{"theme", QVariant::fromValue(&theme)}, {"backend", QVariant::fromValue(&backend)},
+                                 {"preferences", QUrl::fromLocalFile(preferences)}});
     engine.loadFromModule("OmarchySpotify", "Main");
-    if (engine.rootObjects().isEmpty())
+    auto *window = engine.rootObjects().isEmpty() ? nullptr : qobject_cast<QQuickWindow *>(engine.rootObjects().constFirst());
+    if (!window)
         return 1;
+    Instance instance;
+    if (!instance.listen(socket, [window, &backend](const QString &request) {
+        activateWindow(*window, true);
+        if (!request.isEmpty())
+            backend.openUri(request);
+    })) {
+        qWarning() << "Could not open the Omarchy Spotify activation socket:" << instance.errorString();
+        return 1;
+    }
+    window->resize(configureWindow(*window));
+    activateWindow(*window, false);
+    if (!uri.isEmpty())
+        backend.openUri(uri);
 
     // `omarchy agent look app` runs the app offscreen with these set, to see
     // the window without a display: size it to OMARCHY_LOOK_SIZE when given,
@@ -49,7 +98,7 @@ int main(int argc, char *argv[]) {
     // save it once it has settled, and quit.
     if (const QString shot = qEnvironmentVariable("OMARCHY_LOOK_SCREENSHOT"); !shot.isEmpty()) {
         const QStringList size = qEnvironmentVariable("OMARCHY_LOOK_SIZE").split('x');
-        if (auto *window = qobject_cast<QQuickWindow *>(engine.rootObjects().constFirst()); window && size.size() == 2)
+        if (size.size() == 2)
             window->resize(size[0].toInt(), size[1].toInt());
         const QStringList keys = qEnvironmentVariable("OMARCHY_LOOK_KEYS").split(' ', Qt::SkipEmptyParts);
         for (int i = 0; i < keys.size(); ++i) {
@@ -65,9 +114,8 @@ int main(int argc, char *argv[]) {
             });
         }
         const int delay = qEnvironmentVariableIsSet("OMARCHY_LOOK_DELAY_MS") ? qEnvironmentVariableIntValue("OMARCHY_LOOK_DELAY_MS") : 1500;
-        QTimer::singleShot(800 + keys.size() * 300 + delay, &app, [&engine, shot] {
-            if (auto *window = qobject_cast<QQuickWindow *>(engine.rootObjects().constFirst()))
-                window->grabWindow().save(shot);
+        QTimer::singleShot(800 + keys.size() * 300 + delay, &app, [window, shot] {
+            window->grabWindow().save(shot);
             QCoreApplication::quit();
         });
     }

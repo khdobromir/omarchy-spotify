@@ -43,5 +43,8 @@
   "limited": "Spotify временно ограничил частоту обновлений.",
   "quota": "Достигнут лимит запросов Spotify. Обновления возобновятся автоматически.",
   "authorized": "Spotify подключён.",
-  "track": ""
+  "track": "",
+  "openDesktop": "Открыть плеер",
+  "desktop_missing": "Сначала установи приложение Omarchy Spotify.",
+  "desktop_failed": "Не удалось открыть плеер."
 }

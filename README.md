@@ -33,6 +33,14 @@ ctest --test-dir desktop/build --output-on-failure
 cmake --install desktop/build --prefix "$HOME/.local"
 ```
 
-Open **Omarchy Spotify** from the launcher. Enter your own [Soloist API key](https://developer.spotify.com/dashboard/soloist), then select **Omarchy Spotify** in the device picker on your phone once. The app reuses the plugin’s Web API authorization for the library. Space toggles playback, and Enter plays the selected library item when the list has focus. Closing the app stops the local player.
+Open **Omarchy Spotify** from the launcher or choose **Open desktop player** in the widget. Enter your own [Soloist API key](https://developer.spotify.com/dashboard/soloist), then select **Omarchy Spotify** in the device picker on your phone once. The app reuses the widget’s Web API authorization for the library. Closing the app stops the local player.
+
+Choose a track in the widget to play it through the local Soloist. Choose an album or playlist to browse its tracks. The **Play** button on the collection page starts the whole collection. A click on an individual track starts that URI on its own because Soloist’s `ctl play` does not accept an offset within a collection. In Spotify Web API Development Mode, the app can list tracks in [playlists you own or collaborate on](https://developer.spotify.com/documentation/web-api/tutorials/february-2026-migration-guide#playlist-endpoint-renames).
+
+The album tab opens in **Compact grid** on first launch and remembers your choice. Use **Ctrl+1**, **Ctrl+2**, and **Ctrl+3** for the library tabs, **Ctrl+G** for the album layout, and **Alt+Left** to leave a collection. **Enter** opens the selected collection or plays the selected track, and **Space** toggles playback. **F11** opens the full-screen player and **Esc** returns to the library.
+
+On Omarchy’s Lua-based Hyprland, the app registers a session rule for the `omarchy-spotify` window class before it shows the window. The rule floats and centers it. The app sizes it against the focused output’s usable area. A second invocation sends an activation request to the running player and brings its window to the current workspace. No Hyprland configuration file is required.
+
+The launcher accepts one optional Spotify track, album, or playlist URI, for example `omarchy-spotify spotify:album:4m2880jivSbbyEGAKfITCa`. The primary instance holds the instance lock and listens on a user-only local socket in the session runtime directory. Secondary invocations send a bounded request, wait for acknowledgment, and exit.
 
 Omarchy theme and translation support use the [Omarchy app templates](desktop/TEMPLATE-LICENSE).

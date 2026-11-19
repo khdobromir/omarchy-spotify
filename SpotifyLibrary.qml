@@ -87,9 +87,9 @@ ColumnLayout {
       focusable: true
       width: entries.width - Style.space(8)
       height: Style.space(34)
-      Accessible.role: Accessible.Link
       Accessible.name: text
-      onClicked: Qt.openUrlExternally(modelData.url)
+      enabled: !root.spotify.openingDesktop
+      onClicked: root.spotify.openDesktop(modelData.uri)
     }
   }
 

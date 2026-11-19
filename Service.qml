@@ -13,10 +13,21 @@ Scope {
   property var args: []
   property string notice: ""
   property var queued: null
+  property string desktopUri: ""
+  property string desktopNotice: ""
+  readonly property bool openingDesktop: desktop.running
   property bool coolingDown: false
   readonly property bool busy: worker.running
   readonly property bool available: !coolingDown && queued === null && (!busy || action === "status")
   readonly property string helper: Qt.resolvedUrl("spotify.py").toString().slice("file://".length)
+
+  function openDesktop(uri) {
+    if (desktop.running)
+      return
+    root.desktopNotice = ""
+    root.desktopUri = uri
+    desktop.running = true
+  }
 
   function run(command, parameters) {
     if (root.coolingDown && command !== "disconnect")
@@ -114,6 +125,20 @@ Scope {
       else
         root.run("status")
     }
+  }
+
+  Process {
+    id: desktop
+    command: ["python3", "-B", decodeURIComponent(root.helper), "desktop"]
+      .concat(root.desktopUri ? [root.desktopUri] : [])
+    onExited: {
+      let status = "desktop_failed"
+      try {
+        status = JSON.parse(launchResult.text).status
+      } catch (error) {}
+      root.desktopNotice = status === "ok" ? "" : status
+    }
+    stdout: StdioCollector { id: launchResult }
   }
 
   Process {
