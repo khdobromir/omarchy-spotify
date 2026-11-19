@@ -6,17 +6,34 @@ Scope {
   id: root
 
   property var sample: ({ status: "loading" })
+  property var favorite: ({})
+  property var library: ({})
   property double sampledAt: 0
   property string action: "status"
+  property var args: []
+  property string notice: ""
+  property var queued: null
+  property bool coolingDown: false
   readonly property bool busy: worker.running
+  readonly property bool available: !coolingDown && queued === null && (!busy || action === "status")
   readonly property string helper: Qt.resolvedUrl("spotify.py").toString().slice("file://".length)
 
-  function run(command) {
-    if (root.busy)
-      return
+  function run(command, parameters) {
+    if (root.coolingDown && command !== "disconnect")
+      return false
+    if (root.busy) {
+      if (root.action !== "status" || root.queued !== null || command === "status")
+        return false
+      root.queued = [command, parameters]
+      return true
+    }
     poll.stop()
     root.action = command
+    root.args = parameters ?? []
+    if (!["status", "favorite", "library"].includes(command))
+      root.notice = ""
     worker.running = true
+    return true
   }
 
   function finish(text) {
@@ -24,17 +41,62 @@ Scope {
     try {
       result = JSON.parse(text)
     } catch (error) {
-      result = root.action === "status" ? { status: "unavailable", retry: 30 }
-        : { status: root.action === "connect" ? "auth_error" : "disconnect_error" }
+      const fallback = { status: "unavailable", connect: "auth_error", disconnect: "disconnect_error" }
+      result = { status: fallback[root.action] ?? "action_failed" }
+      if (root.action === "status")
+        result.retry = 30
     }
-    root.sampledAt = Date.now()
-    root.sample = result
-    if (result.status === "authorized") {
-      poll.interval = 1
-      poll.start()
-    } else if (result.retry || result.status === "track" || result.status === "idle") {
-      const seconds = result.retry || (result.playing ? 10 : 25)
-      poll.interval = Math.min(seconds * 1000, 2147483647)
+    const status = result.status
+    const command = root.action
+    const sessionEnded = status === "disconnected" || status === "setup_required"
+    const playbackChanged = ["next", "previous", "pause", "play", "seek"].includes(command)
+    if (status === "limited" || status === "quota") {
+      root.coolingDown = true
+      root.queued = null
+    }
+    if (command === "status" || sessionEnded || status === "authorized") {
+      root.sampledAt = Date.now()
+      root.sample = result
+      if (command === "status" && (root.notice === "limited" || root.notice === "quota"))
+        root.notice = ""
+    }
+    if (sessionEnded || status === "authorized") {
+      root.favorite = {}
+      root.library = {}
+      if (sessionEnded)
+        root.coolingDown = false
+    } else if (command === "library") {
+      root.library = Object.assign(result, { kind: root.args[0], offset: Number(root.args[1]) })
+    } else if (["favorite", "save", "remove"].includes(command)) {
+      if (status === "ok" || command === "favorite")
+        root.favorite = Object.assign(result, { id: root.args[0] })
+    }
+    if (root.queued && sessionEnded && !["connect", "disconnect"].includes(root.queued[0]))
+      root.queued = null
+    if (root.queued && ["next", "previous", "pause", "play", "seek"].includes(root.queued[0])
+        && root.queued[1][0] !== result.deviceId) {
+      root.queued = null
+      root.notice = "target_changed"
+    }
+    if (status === "reauthorize")
+      root.sample = Object.assign({}, root.sample, { extended: false })
+    if (command !== "status" && command !== "library" && status !== "ok" && status !== "authorized" && !sessionEnded) {
+      if (command === "connect" && root.sample.status !== "track" && root.sample.status !== "idle")
+        root.sample = result
+      else
+        root.notice = status
+    }
+    let delay = 0
+    if (result.retry)
+      delay = result.retry * 1000
+    else if (root.queued !== null || status === "authorized")
+      delay = 1
+    else if (playbackChanged)
+      delay = 600
+    else if (root.sample.status === "track" || root.sample.status === "idle")
+      delay = root.sample.playing ? 10000 : 25000
+    if (delay > 0) {
+      poll.interval = Math.min(delay, 2147483647)
       poll.start()
     }
   }
@@ -43,12 +105,20 @@ Scope {
 
   Timer {
     id: poll
-    onTriggered: root.run("status")
+    onTriggered: {
+      root.coolingDown = false
+      const pending = root.queued
+      root.queued = null
+      if (pending)
+        root.run(pending[0], pending[1])
+      else
+        root.run("status")
+    }
   }
 
   Process {
     id: worker
-    command: ["python3", "-B", decodeURIComponent(root.helper), root.action]
+    command: ["python3", "-B", decodeURIComponent(root.helper), root.action].concat(root.args)
     onExited: root.finish(response.text)
     stdout: StdioCollector { id: response }
   }

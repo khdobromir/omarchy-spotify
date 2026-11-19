@@ -1,6 +1,6 @@
 # Omarchy Spotify
 
-Shows the current Spotify track in the Omarchy bar, even when it’s playing on another device. Left-click the widget to see the album art, album, progress, and active device.
+Shows the current Spotify track in the Omarchy bar, even when it’s playing on another device. Open the widget to skip tracks, pause, resume, or seek on the active Spotify Connect device. You can add or remove the current song from Liked Songs and browse your liked tracks, saved albums, and playlists in **Library**.
 
 ## Install
 
@@ -16,6 +16,6 @@ Requires an Omarchy version with shell plugin support, Python 3, and a Spotify P
    omarchy plugin add https://github.com/khdobromir/omarchy-spotify.git --enable
    ```
 
-3. Left-click the Spotify icon in the bar, choose **Connect Spotify**, and approve playback read access in your browser.
+3. Left-click the Spotify icon in the bar, choose **Connect Spotify**, and approve playback and library access in your browser. If you already connected the read-only widget, choose **Enable controls and library** to grant the new permissions.
 
 The plugin checks Spotify every 10 seconds while a song is playing and every 25 seconds while paused or idle. It uses OAuth with PKCE and keeps tokens in `${XDG_STATE_HOME:-~/.local/state}/omarchy/spotify/`. **Disconnect** stops updates and removes the local tokens.
