@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Omarchy Spotify
+Comment=Browse and play Spotify on this computer
+Comment[ru]=Медиатека и воспроизведение Spotify на этом компьютере
+Exec=omarchy-spotify
+Icon=multimedia-player
+Terminal=false
+Categories=AudioVideo;Audio;Player;

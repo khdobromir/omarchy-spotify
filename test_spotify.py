@@ -72,6 +72,7 @@ class SpotifyTests(unittest.TestCase):
                 self.assertEqual(page["next"], 40)
                 self.assertEqual(page["items"][0]["url"],
                                  "https://open.spotify.com/" + singular + "/" + "a" * 22)
+                self.assertEqual(page["items"][0]["uri"], "spotify:" + singular + ":" + "a" * 22)
                 self.assertTrue(page["items"][0]["title"].startswith("<"))
                 request.assert_called_once_with(spotify.API_URL + "/me/" + kind + "?limit=20&offset=20",
                                                 token="test", limit=spotify.LIBRARY_RESPONSE_LIMIT)
@@ -83,6 +84,15 @@ class SpotifyTests(unittest.TestCase):
             old = {"refresh_token": "refresh", "scope": "user-library-read"}
             result = spotify.refresh_tokens(old, CLIENT_ID)
             self.assertEqual(result["scope"], old["scope"])
+
+    def test_rejected_token_uses_session_already_refreshed_by_other_process(self):
+        with TemporaryDirectory() as folder, patch.object(
+            spotify, "TOKEN_FILE", Path(folder) / "tokens.json"
+        ), patch.object(spotify, "request_json") as request:
+            current = spotify.store_tokens({"access_token": "new", "refresh_token": "refresh",
+                                            "expires_in": 3600}, CLIENT_ID)
+            self.assertEqual(spotify.session_tokens(CLIENT_ID, rejected="old"), current)
+            request.assert_not_called()
 
     def test_client_id_is_loaded_before_authorization(self):
         with TemporaryDirectory() as folder, patch.object(

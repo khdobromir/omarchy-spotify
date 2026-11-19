@@ -1,4 +1,6 @@
 import base64
+from contextlib import contextmanager
+import fcntl
 import hashlib
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
@@ -142,6 +144,7 @@ def library_page(kind, offset, token):
         if identity and title:
             subtitle = label(record(item.get("owner")).get("display_name")) if kind == "playlists" else artist_label(item)
             items.append({"title": title, "subtitle": subtitle,
+                          "uri": f"spotify:{singular}:{identity}",
                           "url": f"https://open.spotify.com/{singular}/{identity}"})
     next_offset = offset + PAGE_SIZE
     return {"status": "ok", "items": items,
@@ -202,6 +205,15 @@ def load_tokens():
         return None
 
 
+@contextmanager
+def token_lock():
+    TOKEN_FILE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(TOKEN_FILE.with_suffix(".lock"), os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
 def store_tokens(response, client_id, previous_refresh=None, previous_scope=""):
     access = response.get("access_token")
     refresh = response.get("refresh_token", previous_refresh)
@@ -248,15 +260,27 @@ def has_extended_scope(tokens):
     return isinstance(scope, str) and SCOPES.issubset(scope.split())
 
 
-def account_operation(client_id, command, args):
+def session_tokens(client_id, rejected=None):
     tokens = load_tokens()
     if tokens is None or tokens.get("client_id", client_id) != client_id:
+        return None
+    if rejected is None and "client_id" in tokens and tokens["expires_at"] > time.time() + 30:
+        return tokens
+    # The desktop player and bar widget share this session and may refresh it together.
+    with token_lock():
+        tokens = load_tokens()
+        if tokens is None or tokens.get("client_id", client_id) != client_id:
+            return None
+        if ("client_id" not in tokens or tokens["expires_at"] <= time.time() + 30
+                or tokens["access_token"] == rejected):
+            return refresh_tokens(tokens, client_id)
+        return tokens
+
+
+def account_operation(client_id, command, args):
+    tokens = session_tokens(client_id)
+    if tokens is None:
         return {"status": "disconnected"}
-    # Validate older sessions against this client before reusing them.
-    if "client_id" not in tokens or tokens["expires_at"] <= time.time() + 30:
-        tokens = refresh_tokens(tokens, client_id)
-        if tokens is None:
-            return {"status": "disconnected"}
     if command != "status" and not has_extended_scope(tokens):
         return {"status": "reauthorize"}
     try:
@@ -265,7 +289,7 @@ def account_operation(client_id, command, args):
         if error.code != 401:
             raise
         error.close()
-        tokens = refresh_tokens(tokens, client_id)
+        tokens = session_tokens(client_id, rejected=tokens["access_token"])
         if tokens is None:
             return {"status": "disconnected"}
         if command != "status" and not has_extended_scope(tokens):
@@ -330,13 +354,14 @@ def connect(client_id):
             message = b"Spotify authorization was declined. You can close this tab."
             if code:
                 try:
-                    store_tokens(request_json(TOKEN_URL, form={
-                        "grant_type": "authorization_code",
-                        "code": code,
-                        "redirect_uri": REDIRECT_URI,
-                        "client_id": client_id,
-                        "code_verifier": verifier,
-                    }), client_id, previous_scope=" ".join(sorted(SCOPES)))
+                    with token_lock():
+                        store_tokens(request_json(TOKEN_URL, form={
+                            "grant_type": "authorization_code",
+                            "code": code,
+                            "redirect_uri": REDIRECT_URI,
+                            "client_id": client_id,
+                            "code_verifier": verifier,
+                        }), client_id, previous_scope=" ".join(sorted(SCOPES)))
                     message = b"Spotify connected. You can close this tab."
                     reason = "authorized"
                 except (OSError, ValueError, KeyError, TypeError):
@@ -384,7 +409,8 @@ def http_failure(error):
 def main(command, *args):
     try:
         if command == "disconnect":
-            TOKEN_FILE.unlink(missing_ok=True)
+            with token_lock():
+                TOKEN_FILE.unlink(missing_ok=True)
             return {"status": "disconnected"}
         elif command not in ("connect", "status", "library", "favorite", "save", "remove") and command not in PLAYER_METHODS:
             raise ValueError("Unknown command")
