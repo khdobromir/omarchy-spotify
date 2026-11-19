@@ -90,12 +90,13 @@ ColumnLayout {
   Component.onCompleted: if (root.browsing && !root.displayedCategory) root.show(root.category)
 
   Connections {
-    target: root.spotify
+    target: root.spotify ?? null
     function onLibraryChanged() {
-      root.applyPage(root.spotify.library)
+      if (root.spotify)
+        root.applyPage(root.spotify.library)
     }
     function onSampleChanged() {
-      if (["authorized", "disconnected", "setup_required", "reauthorize"].includes(root.spotify.sample.status)) {
+      if (["authorized", "disconnected", "setup_required", "reauthorize"].includes(root.spotify?.sample.status)) {
         root.contexts = {}
         root.request = null
         root.displayedCategory = ""
@@ -109,10 +110,10 @@ ColumnLayout {
   Timer {
     interval: 1
     running: root.browsing && !!root.context.pending && root.request === null
-      && root.spotify.available && !root.spotify.busy
+      && !!root.spotify?.available && !root.spotify.busy
     onTriggered: {
       const offset = root.context.next
-      if (root.spotify.run("library", [root.category, String(offset)])) {
+      if (root.spotify?.run("library", [root.category, String(offset)])) {
         root.request = { kind: root.category, offset: offset }
         root.update(root.category, { pending: false })
       }
@@ -182,9 +183,9 @@ ColumnLayout {
       focusable: true
       width: entries.width - Commons.Style.space(8)
       height: Commons.Style.space(34)
-      enabled: !root.spotify.openingDesktop
+      enabled: !!root.spotify && !root.spotify.openingDesktop
       Accessible.name: entry.text
-      onClicked: root.spotify.openDesktop(
+      onClicked: root.spotify?.openDesktop(
         root.category === "tracks" ? "--play-track"
           : root.category === "albums" ? "--open-album" : "--open-playlist", entry.uri)
     }
@@ -211,7 +212,7 @@ ColumnLayout {
       text: root.translations.t("retry")
       foreground: root.foreground
       focusable: true
-      enabled: root.spotify.available
+      enabled: !!root.spotify?.available
       onClicked: root.update(root.category, { status: entries.count > 0 ? "loadingMore" : "loading", pending: true })
     }
   }
