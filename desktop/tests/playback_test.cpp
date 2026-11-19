@@ -20,8 +20,35 @@ private slots:
         QVERIFY(playback.apply("2 {\"type\":\"playback_changed\",\"status\":\"paused\"}", 2000));
         QCOMPARE(playback.position(3000), 4000);
         QVERIFY(playback.apply("3 {\"type\":\"track_changed\",\"item\":{}}", 3000));
+        QCOMPARE(playback.title, "<Song>");
+        QCOMPARE(playback.position(3000), 4000);
+        QVERIFY(playback.apply(R"(4 {"type":"playback_state","status":"paused"})", 3100));
+        QCOMPARE(playback.title, "<Song>");
+        QCOMPARE(playback.position(3200), 4000);
+        QVERIFY(playback.apply(R"(5 {"type":"playback_changed","status":"playing"})", 3200));
+        QCOMPARE(playback.position(3300), 4100);
+        QVERIFY(playback.apply(R"(6 {"type":"position_sync","position":{"position_ms":18000,"timestamp_ms":3400,"speed":1}})", 3400));
+        QCOMPARE(playback.position(3400), 18000);
+        QCOMPARE(playback.title, "<Song>");
+        QVERIFY(playback.apply(R"(7 {"type":"playback_changed","status":"idle"})", 3500));
         QVERIFY(playback.uri.isEmpty());
-        QCOMPARE(playback.position(3000), 0);
+        QVERIFY(playback.title.isEmpty());
+        QCOMPARE(playback.position(3600), 0);
+    }
+
+    void changesIdentityAndRejectsOldPosition() {
+        Playback playback;
+        QVERIFY(playback.apply(R"(1 {"type":"track_changed","item":{"uri":"spotify:track:aaaaaaaaaaaaaaaaaaaaaa","decorations":{"identity":{"name":"First"}}}})", 2100));
+        QVERIFY(playback.apply(R"(2 {"type":"position_sync","position":{"position_ms":9000,"timestamp_ms":2200,"speed":1}})", 2200));
+        QCOMPARE(playback.position(2300), 9100);
+        QVERIFY(playback.apply(R"(3 {"type":"track_changed","item":{"uri":"spotify:track:bbbbbbbbbbbbbbbbbbbbbb"}})", 2300));
+        QVERIFY(playback.title.isEmpty());
+        QVERIFY(playback.apply(R"(4 {"type":"position_sync","position":{"position_ms":9900,"timestamp_ms":2190,"speed":1}})", 2400));
+        QCOMPARE(playback.position(2400), 0);
+        QVERIFY(playback.apply(R"(5 {"type":"track_changed","item":{"uri":"spotify:track:bbbbbbbbbbbbbbbbbbbbbb","decorations":{"identity":{"name":"Second"}}}})", 2500));
+        QVERIFY(playback.apply(R"(6 {"type":"track_changed","item":{"uri":"spotify:track:bbbbbbbbbbbbbbbbbbbbbb","decorations":{"playback":{"duration_ms":90000}}}})", 2600));
+        QCOMPARE(playback.title, "Second");
+        QCOMPARE(playback.duration, 90000);
     }
 
     void malformedInputAndArtwork() {
@@ -37,7 +64,7 @@ private slots:
 
     void coverSizeIsChosenAcrossTrackAndAlbum() {
         Playback playback;
-        const QByteArray event = "1 {\"type\":\"track_changed\",\"item\":{\"decorations\":{"
+        const QByteArray event = "1 {\"type\":\"track_changed\",\"item\":{\"uri\":\"spotify:track:aaaaaaaaaaaaaaaaaaaaaa\",\"decorations\":{"
             "\"visual_identity\":{\"cover\":["
             "{\"url\":\"https://i.scdn.co/image/111\",\"size\":\"small\"},"
             "{\"url\":\"https://i.scdn.co/image/333\",\"size\":\"large\"},"

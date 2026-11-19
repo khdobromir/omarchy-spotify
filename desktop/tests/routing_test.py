@@ -15,32 +15,7 @@ PYTHON = shutil.which("python3")
 TRACK = "spotify:track:" + "t" * 22
 ALBUM = "spotify:album:" + "a" * 22
 PLAYLIST = "spotify:playlist:" + "p" * 22
-HELPER = r'''
-import json, os, pathlib, sys, time
-root = pathlib.Path(os.environ["XDG_STATE_HOME"])
-args = sys.argv[1:]
-if pathlib.Path(sys.argv[0]).name == "soloist":
-    data = pathlib.Path(args[args.index("--data-dir") + 1])
-    if args[0] != "ctl":
-        (root / "daemon").write_text(str(os.getpid()))
-        (data / "soloist.pid").write_text(str(os.getpid()))
-        (data / "ws.port").write_text("8001")
-        (data / "ws.addr").write_text("127.0.0.1")
-        time.sleep(20)
-    elif args[1] == "trace":
-        time.sleep(0.6)
-        print('0 {"type":"auth_state","logged_in":true}', flush=True)
-        time.sleep(20)
-    else:
-        with (root / "played").open("a") as log:
-            print(json.dumps(args[1:-2]), file=log)
-else:
-    with (root / "web").open("a") as log:
-        print(json.dumps(args[2:]), file=log)
-    time.sleep(0.1)
-    print(json.dumps({"status":"ok","items":[],
-                      "collection":{"title":"Test collection","uri":args[3]}}))
-'''
+HELPER = Path(__file__).with_name("fixture.py").read_text()
 
 
 class RoutingTest(unittest.TestCase):
@@ -48,13 +23,17 @@ class RoutingTest(unittest.TestCase):
         directory = TemporaryDirectory(prefix="spotify-test-")
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
-        self.env = dict(os.environ, QT_QPA_PLATFORM="offscreen",
+        self.env = dict(os.environ, QT_QPA_PLATFORM="offscreen", QT_QPA_PLATFORMTHEME="",
+                        QT_FORCE_STDERR_LOGGING="1",
                         XDG_RUNTIME_DIR=directory.name,
                         XDG_STATE_HOME=directory.name, XDG_CONFIG_HOME=directory.name,
                         XDG_CACHE_HOME=directory.name,
                         PATH=directory.name + ":" + os.environ["PATH"])
+        (self.root / "omarchy-spotify").mkdir()
+        (self.root / "omarchy-spotify-bin").mkdir()
+        (self.root / "omarchy-spotify-bin" / "omarchy-spotify").symlink_to(APP)
+        self.env["PATH"] = str(self.root / "omarchy-spotify-bin") + ":" + self.env["PATH"]
         state = self.root / "omarchy-spotify"
-        state.mkdir()
         (state / "soloist-key").write_text("fixture")
         for name in ("soloist", "python3"):
             path = self.root / name
@@ -92,26 +71,43 @@ class RoutingTest(unittest.TestCase):
         self.fail(f"{entry!r} missing in {name}: {self.log(name)!r}")
 
     def test_cold_track_waits_for_soloist_and_collection_launches_only_browse(self):
-        app = self.start(TRACK)
+        app = self.start("--play-track", TRACK)
         self.await_log("played", ["play", TRACK])
         daemon = (self.root / "daemon").read_text()
         for collection in (ALBUM, PLAYLIST):
-            result = self.launch(collection)
+            result = self.launch("--open-album" if collection == ALBUM else "--open-playlist", collection)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.await_log("web", ["collection", collection, "0"])
-        self.assertEqual(self.launch().returncode, 0)
+        self.assertEqual(self.launch("--activate").returncode, 0)
+        self.assertEqual(self.launch("--open-track", TRACK).returncode, 0)
         self.assertEqual(app.poll(), None)
         self.assertEqual((self.root / "daemon").read_text(), daemon)
+        self.assertEqual(self.log("played"), [["play", TRACK]])
+
+    def test_widget_launcher_cold_then_warm(self):
+        result = subprocess.run([PYTHON, Path(__file__).resolve().parents[2] / "spotify.py",
+                                 "desktop", "--play-track", TRACK],
+                                env=self.env, capture_output=True, timeout=8)
+        self.assertEqual(json.loads(result.stdout), {"status": "ok"})
+        self.await_log("played", ["play", TRACK])
+        app_pid = int((self.root / "omarchy-spotify.lock").read_text().splitlines()[0])
+        self.addCleanup(os.kill, app_pid, 15)
+        result = subprocess.run([PYTHON, Path(__file__).resolve().parents[2] / "spotify.py",
+                                 "desktop", "--open-track", TRACK],
+                                env=self.env, capture_output=True, timeout=8)
+        self.assertEqual(json.loads(result.stdout), {"status": "ok"})
         self.assertEqual(self.log("played"), [["play", TRACK]])
 
     def test_invalid_command_is_rejected(self):
         for command in ("https://example.org", TRACK + "\n", "--unexpected", "spotify:episode:" + "x" * 22):
             with self.subTest(command=command):
                 self.assertNotEqual(self.launch(command).returncode, 0)
+        self.assertNotEqual(self.launch("--open-track", ALBUM).returncode, 0)
+        self.assertNotEqual(self.launch("--play-track", PLAYLIST).returncode, 0)
         self.assertFalse((self.root / "daemon").exists())
 
     def test_cold_collection_browses_without_playback_and_rejects_invalid_ipc(self):
-        self.start(PLAYLIST)
+        self.start("--open-playlist", PLAYLIST)
         self.await_log("web", ["collection", PLAYLIST, "0"])
         sock = self.root / "omarchy-spotify.sock"
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
@@ -122,6 +118,14 @@ class RoutingTest(unittest.TestCase):
         self.assertEqual(self.launch(ALBUM).returncode, 0)
         self.await_log("web", ["collection", ALBUM, "0"])
         self.assertEqual(self.log("played"), [])
+
+    def test_locked_instance_without_socket_does_not_start_another_player(self):
+        self.start()
+        self.await_log("web", ["library", "tracks", "0"])
+        daemon = (self.root / "daemon").read_text()
+        (self.root / "omarchy-spotify.sock").unlink()
+        self.assertNotEqual(self.launch("--activate").returncode, 0)
+        self.assertEqual((self.root / "daemon").read_text(), daemon)
 
 
 if __name__ == "__main__":

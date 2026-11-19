@@ -11,9 +11,7 @@
   "albums": "Альбомы",
   "playlists": "Плейлисты",
   "libraryLoading": "Загружаю медиатеку…",
-  "libraryEmpty": "На этой странице ничего нет.",
-  "previousPage": "Пред. страница",
-  "nextPage": "След. страница",
+  "libraryEmpty": "В медиатеке ничего нет.",
   "previous": "Предыдущий трек",
   "next": "Следующий трек",
   "play": "Играть",
@@ -31,7 +29,6 @@
   "paused": "На паузе",
   "pausedOn": "%1 · на паузе",
   "time": "%1 / %2",
-  "openSpotify": "Открыть в Spotify",
   "retry": "Повторить",
   "denied": "Доступ к Spotify отклонён.",
   "auth_timeout": "Время ожидания входа в Spotify истекло.",
@@ -46,5 +43,8 @@
   "track": "",
   "openDesktop": "Открыть плеер",
   "desktop_missing": "Сначала установи приложение Omarchy Spotify.",
-  "desktop_failed": "Не удалось открыть плеер."
+  "desktop_failed": "Не удалось открыть плеер.",
+  "openTrack": "Открыть трек",
+  "libraryLoadingMore": "Загружаю ещё…",
+  "libraryMoreError": "Не удалось загрузить ещё."
 }

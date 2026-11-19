@@ -114,14 +114,33 @@ class SpotifyTests(unittest.TestCase):
         uri = "spotify:album:" + "a" * 22
         with patch.object(spotify.shutil, "which", return_value="/test/omarchy-spotify"), patch.object(
             spotify.subprocess, "Popen"
-        ) as start, patch.object(spotify, "load_client_id") as client_id:
-            start.return_value.wait.return_value = 0
-            self.assertEqual(spotify.main("desktop", uri), {"status": "ok"})
-            self.assertEqual(start.call_args.args[0], ["/test/omarchy-spotify", uri])
+        ) as start, patch.object(spotify, "load_client_id") as client_id, patch.object(
+            spotify.select, "select", return_value=([True], [], [])
+        ):
+            start.return_value.stdout.__enter__.return_value.readline.return_value = b"1\n"
+            self.assertEqual(spotify.main("desktop", "--open-album", uri), {"status": "ok"})
+            self.assertEqual(start.call_args.args[0], ["/test/omarchy-spotify", "--open-album", uri])
             self.assertNotIn("shell", start.call_args.kwargs)
             self.assertEqual(spotify.main("desktop", uri + "\n"), {"status": "desktop_failed"})
+            self.assertEqual(spotify.main("desktop", "--play-track", uri), {"status": "desktop_failed"})
             self.assertEqual(start.call_count, 1)
+            start.return_value.stdout.__enter__.return_value.readline.return_value = b""
+            self.assertEqual(spotify.main("desktop", "--activate"), {"status": "desktop_failed"})
             client_id.assert_not_called()
+
+    def test_desktop_missing_executable(self):
+        with patch.object(spotify.shutil, "which", return_value=None):
+            self.assertEqual(spotify.main("desktop", "--activate"), {"status": "desktop_missing"})
+
+    def test_track_metadata_uses_existing_normalization(self):
+        full = {"id": "a" * 22, "name": "Song", "album": {"name": "Album", "images": [
+            {"url": "https://i.scdn.co/image/111", "width": 300},
+            {"url": "https://i.scdn.co/image/222", "width": 640},
+        ]}}
+        with patch.object(spotify, "request_json", return_value=full):
+            result = spotify.perform("track", ("a" * 22,), "test")
+        self.assertEqual(result["track"]["album"], "Album")
+        self.assertEqual(result["track"]["artHigh"], "https://i.scdn.co/image/222")
 
     def test_invalid_collection_uri_makes_no_api_call(self):
         with patch.object(spotify, "request_json") as request:

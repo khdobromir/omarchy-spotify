@@ -13,6 +13,8 @@
 #include <QTimer>
 #include <QUrl>
 
+#include <cstdio>
+
 #include "backend.h"
 #include "instance.h"
 #include "window.h"
@@ -39,19 +41,30 @@ int main(int argc, char *argv[]) {
 
     app.setDesktopFileName("omarchy-spotify");
     app.setWindowIcon(QIcon::fromTheme("multimedia-player"));
-    const auto args = app.arguments();
-    const QString uri = args.value(1);
-    if (args.size() > 2 || (args.size() == 2 && (uri.isEmpty() || !Instance::validRequest(uri)))) {
-        qWarning("Usage: omarchy-spotify [spotify:track|album|playlist:ID]");
+    const auto args = app.arguments().mid(1);
+    const auto request = Instance::parse(args);
+    if (!request) {
+        qWarning("Usage: omarchy-spotify [--activate | [--open-track|--play-track|--open-album|--open-playlist] Spotify-URI]");
         return 2;
     }
-
-    const QDir runtime(QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation));
+    const auto reportReady = [] {
+        if (qEnvironmentVariableIntValue("OMARCHY_SPOTIFY_REPORT_READY") == 1) {
+            std::puts("1");
+            std::fflush(stdout);
+        }
+    };
+    const QString runtimePath = QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation);
+    if (runtimePath.isEmpty())
+        return 1;
+    const QDir runtime(runtimePath);
     const QString socket = runtime.filePath("omarchy-spotify.sock");
     QLockFile lock(runtime.filePath("omarchy-spotify.lock"));
+    lock.setStaleLockTime(0);
     if (!lock.tryLock(0)) {
-        if (lock.error() == QLockFile::LockFailedError && Instance::forward(socket, uri))
+        if (lock.error() == QLockFile::LockFailedError && Instance::forward(socket, args)) {
+            reportReady();
             return 0;
+        }
         qWarning("Could not contact the running Omarchy Spotify instance");
         return 1;
     }
@@ -78,19 +91,29 @@ int main(int argc, char *argv[]) {
     auto *window = engine.rootObjects().isEmpty() ? nullptr : qobject_cast<QQuickWindow *>(engine.rootObjects().constFirst());
     if (!window)
         return 1;
+    const auto route = [window, &backend](const Instance::Request &incoming) {
+        using Action = Instance::Action;
+        if (incoming.action == Action::Activate)
+            return;
+        window->setProperty("nowPlayingExpanded", incoming.action == Action::OpenTrack
+                            && backend.playback().value("uri").toString() == incoming.uri);
+        if (incoming.action == Action::OpenTrack)
+            backend.openTrack(incoming.uri);
+        else
+            backend.openUri(incoming.uri);
+    };
     Instance instance;
-    if (!instance.listen(socket, [window, &backend](const QString &request) {
+    if (!instance.listen(socket, [window, &route](const Instance::Request &incoming) {
         activateWindow(*window, true);
-        if (!request.isEmpty())
-            backend.openUri(request);
+        route(incoming);
     })) {
         qWarning() << "Could not open the Omarchy Spotify activation socket:" << instance.errorString();
         return 1;
     }
     window->resize(configureWindow(*window));
     activateWindow(*window, false);
-    if (!uri.isEmpty())
-        backend.openUri(uri);
+    route(*request);
+    reportReady();
 
     // `omarchy agent look app` runs the app offscreen with these set, to see
     // the window without a display: size it to OMARCHY_LOOK_SIZE when given,

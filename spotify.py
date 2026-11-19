@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import select
 import shutil
 import subprocess
 import sys
@@ -223,8 +224,14 @@ def perform(command, args, token):
         match = re.fullmatch(r"spotify:(album|playlist):([a-zA-Z0-9]{22})", args[0])
         if match and int(args[1]) <= MAX_OFFSET:
             return collection_page(*match.groups(), int(args[1]), token)
-    if command == "track" and len(args) == 1 and item_id(args[0]):
-        track = library_item(record(request_json(f"{API_URL}/tracks/{args[0]}", token=token)), "track")
+    if command in ("track", "episode") and len(args) == 1 and item_id(args[0]):
+        item = record(request_json(f"{API_URL}/{command}s/{args[0]}", token=token))
+        track = library_item(item, command)
+        if track:
+            parent = record(item.get("album" if command == "track" else "show"))
+            track["album"] = label(parent.get("name"))
+            if command == "episode":
+                track["subtitle"] = label(parent.get("publisher"))
         return {"status": "ok", "track": track} if track else {"status": "unavailable"}
     if command in ("favorite", "save", "remove") and len(args) == 1 and item_id(args[0]):
         query = "?" + urlencode({"uris": "spotify:track:" + args[0]})
@@ -349,7 +356,8 @@ def account_operation(client_id, command, args):
     tokens = session_tokens(client_id)
     if tokens is None:
         return {"status": "disconnected"}
-    if command != "status" and not has_extended_scope(tokens):
+    needs_scope = command not in ("status", "track", "episode")
+    if needs_scope and not has_extended_scope(tokens):
         return {"status": "reauthorize"}
     try:
         result = perform(command, args, tokens["access_token"])
@@ -360,7 +368,7 @@ def account_operation(client_id, command, args):
         tokens = session_tokens(client_id, rejected=tokens["access_token"])
         if tokens is None:
             return {"status": "disconnected"}
-        if command != "status" and not has_extended_scope(tokens):
+        if needs_scope and not has_extended_scope(tokens):
             return {"status": "reauthorize"}
         result = perform(command, args, tokens["access_token"])
     if command == "status":
@@ -475,20 +483,27 @@ def http_failure(error):
 
 
 def launch_desktop(args):
-    if len(args) > 1 or (args and not re.fullmatch(r"spotify:(track|album|playlist):[a-zA-Z0-9]{22}", args[0])):
+    actions = {"--open-track": "track", "--play-track": "track",
+               "--open-album": "album", "--open-playlist": "playlist"}
+    valid_uri = r"spotify:(track|album|playlist):[a-zA-Z0-9]{22}"
+    if len(args) == 2:
+        match = re.fullmatch(valid_uri, args[1])
+        valid = match is not None and actions.get(args[0]) == match[1]
+    else:
+        valid = not args or len(args) == 1 and (args[0] == "--activate" or re.fullmatch(valid_uri, args[0]))
+    if not valid:
         return {"status": "desktop_failed"}
     executable = shutil.which("omarchy-spotify") or shutil.which(str(Path.home() / ".local/bin/omarchy-spotify"))
     if not executable:
         return {"status": "desktop_missing"}
-    try:
-        player = subprocess.Popen([executable, *args], stdin=subprocess.DEVNULL,
-                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                  start_new_session=True)
-        if player.wait(timeout=0.5) != 0:
-            return {"status": "desktop_failed"}
-    except subprocess.TimeoutExpired:
-        pass
-    return {"status": "ok"}
+    player = subprocess.Popen([executable, *args], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              env={**os.environ, "OMARCHY_SPOTIFY_REPORT_READY": "1"},
+                              start_new_session=True)
+    with player.stdout as ready:
+        if select.select([ready], [], [], 6)[0] and ready.readline(2) == b"1\n":
+            return {"status": "ok"}
+    return {"status": "desktop_failed"}
 
 
 def main(command, *args):
@@ -499,7 +514,7 @@ def main(command, *args):
             with token_lock():
                 TOKEN_FILE.unlink(missing_ok=True)
             return {"status": "disconnected"}
-        elif command not in ("connect", "status", "library", "collection", "track", "favorite", "save", "remove") and command not in PLAYER_METHODS:
+        elif command not in ("connect", "status", "library", "collection", "track", "episode", "favorite", "save", "remove") and command not in PLAYER_METHODS:
             raise ValueError("Unknown command")
         client_id = load_client_id()
         if client_id is None:

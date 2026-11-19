@@ -28,6 +28,7 @@ PopupCard {
   readonly property color textColor: Commons.Color.popups.text
   readonly property color secondaryColor: Qt.tint(textColor, Qt.alpha(Commons.Color.popups.background, 0.30))
   property bool libraryOpen: false
+  property bool libraryVisited: false
   property string favoriteRequested: ""
   property double now: 0
   readonly property real elapsed: hasProgress
@@ -113,19 +114,23 @@ PopupCard {
         foreground: root.textColor
         selected: root.showingLibrary
         focusable: true
-        onClicked: root.libraryOpen = true
+        onClicked: {
+          root.libraryVisited = true
+          root.libraryOpen = true
+        }
       }
     }
 
     Loader {
-      active: root.open && root.showingLibrary
-      visible: active
+      active: root.libraryVisited
+      visible: root.open && root.showingLibrary
       Layout.fillWidth: true
       sourceComponent: Component {
         SpotifyLibrary {
           spotify: root.spotify
           translations: strings
           foreground: root.textColor
+          browsing: root.open && root.showingLibrary
         }
       }
     }
@@ -315,7 +320,7 @@ PopupCard {
       text: strings.t("openDesktop")
       foreground: root.textColor
       focusable: true
-      onClicked: root.spotify.openDesktop("")
+      onClicked: root.spotify.openDesktop("--activate")
     }
 
     PlainLabel {
@@ -343,14 +348,14 @@ PopupCard {
 
       Button {
         iconText: root.spotifyIcon
-        text: root.hasTrack ? strings.t("openSpotify") : strings.t("connect")
+        text: root.hasTrack ? strings.t("openTrack") : strings.t("connect")
         foreground: root.textColor
         focusable: true
         visible: root.hasTrack || root.canConnect
-        enabled: root.hasTrack || root.ready
+        enabled: root.hasTrack ? !!root.spotify && !root.spotify.openingDesktop : root.ready
         onClicked: {
           if (root.hasTrack)
-            Qt.openUrlExternally(root.sample.url)
+            root.spotify.openDesktop("--open-track", "spotify:track:" + root.sample.trackId)
           else
             root.spotify.run("connect")
         }

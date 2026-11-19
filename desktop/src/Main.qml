@@ -17,7 +17,18 @@ ApplicationWindow {
     readonly property var track: backend.playback
     readonly property bool canPlay: track.ready && !backend.commandBusy
     readonly property bool keyEntry: ["key_required", "key_write", "player_failed"].includes(backend.playerStatus)
-    readonly property bool fullscreen: visibility === Window.FullScreen
+    property bool nowPlayingExpanded: false
+    readonly property string trackTitle: {
+        if (track.title)
+            return track.title
+        if (!track.ready)
+            return qsTr("Player disconnected")
+        if (track.idle)
+            return qsTr("Nothing is playing")
+        if (track.loadingMetadata || !track.uri)
+            return qsTr("Loading track…")
+        return qsTr("Track details unavailable")
+    }
     readonly property bool showingCollection: backend.collectionUri !== ""
     readonly property bool showingGrid: backend.category === "albums" && !showingCollection
     readonly property bool showingLists: backend.category === "playlists" && !showingCollection
@@ -27,10 +38,8 @@ ApplicationWindow {
     readonly property color surface: Qt.tint(theme.background, Qt.alpha(theme.foreground, theme.light ? 0.045 : 0.065))
     readonly property color line: Qt.alpha(theme.foreground, 0.13)
     readonly property int inset: width < 620 ? 12 : 22
-    readonly property string scrollKey: backend.category + "/" + backend.offset
-        + (showingGrid ? (prefs.compact ? "/compact" : "/grid") : "")
-    property var scrollPositions: ({})
-    property bool wasMaximized: false
+    property string restoredContext: ""
+    property bool restorePending: true
 
     title: "Omarchy Spotify"
     color: theme.background
@@ -50,36 +59,70 @@ ApplicationWindow {
 
     function switchCategory(kind: string) {
         if (backend.category !== kind || showingCollection)
-            backend.loadLibrary(kind, 0)
+            backend.loadLibrary(kind)
     }
 
-    onFullscreenChanged: if (!fullscreen)
-        Qt.callLater(() => (window.showingGrid ? albums : rows).forceActiveFocus())
+    onNowPlayingExpandedChanged: {
+        if (!nowPlayingExpanded) {
+            Qt.callLater(window.restoreScroll)
+            Qt.callLater(() => (window.showingGrid ? albums : rows).forceActiveFocus())
+        }
+        Qt.callLater(window.maybeLoadMore)
+    }
 
-    function setFullscreen(enabled: bool) {
-        if (enabled) {
-            wasMaximized = visibility === Window.Maximized
-            showFullScreen()
-        } else if (wasMaximized) {
-            showMaximized()
-        } else {
-            showNormal()
+    Connections {
+        target: window.backend
+        function onLibraryContextChanged() {
+            window.scheduleRestore()
+        }
+        function onLibraryChanged() {
+            Qt.callLater(window.maybeLoadMore)
         }
     }
 
-    function rememberScroll(view: Flickable) {
-        if (!showingCollection && backend.libraryStatus === "ok")
-            scrollPositions[scrollKey] = Math.max(0, view.contentY - view.originY)
+    function columnCount(view: Flickable): int {
+        return view === albums ? Math.max(1, Math.floor((albums.width - 9) / albums.cellWidth)) : 1
     }
 
-    function restoreScroll(view: Flickable) {
-        const key = scrollKey
-        Qt.callLater(function () {
-            if (key !== window.scrollKey || window.showingCollection || !view.visible)
+    function rememberScroll(view: Flickable) {
+        if (!view.visible || restorePending || restoredContext !== backend.libraryContext)
+            return
+        const stride = view === albums ? albums.cellHeight : 55
+        backend.rememberScroll(Math.max(0, view.contentY - view.originY) * columnCount(view) / stride)
+    }
+
+    function scheduleRestore() {
+        restorePending = true
+        Qt.callLater(window.restoreScroll)
+    }
+
+    function restoreScroll() {
+        if (!restorePending || nowPlayingExpanded)
+            return
+        if (showingGrid) {
+            if (albums.count === 0)
                 return
-            view.contentY = view.originY + Math.min(window.scrollPositions[key] || 0,
-                Math.max(0, view.contentHeight - view.height))
-        })
+            albums.forceLayout()
+            albums.contentY = albums.originY + Math.min(Math.floor(backend.libraryScroll() / columnCount(albums)) * albums.cellHeight,
+                Math.max(0, albums.contentHeight - albums.height))
+        } else {
+            if (rows.count === 0)
+                return
+            rows.forceLayout()
+            rows.contentY = rows.originY + Math.min(backend.libraryScroll() * 55,
+                Math.max(0, rows.contentHeight - rows.height))
+        }
+        restoredContext = backend.libraryContext
+        restorePending = false
+        maybeLoadMore()
+    }
+
+    function maybeLoadMore() {
+        if (nowPlayingExpanded || backend.libraryStatus !== "ok" || backend.nextOffset < 0)
+            return
+        const view = showingGrid ? albums : rows
+        if (view.height > 0 && view.contentHeight - (view.contentY - view.originY) - view.height < 220)
+            backend.loadMore()
     }
 
     function activateEntry(entry: var) {
@@ -112,7 +155,8 @@ ApplicationWindow {
 
     function libraryMessage(status: string): string {
         switch (status) {
-        case "loading": return qsTr("Loading your library…")
+        case "loading":
+        case "loadingMore": return qsTr("Loading your library…")
         case "connecting": return qsTr("Approve library access in your browser.")
         case "setup_required": return qsTr("Save your Spotify Client ID in the Omarchy configuration first.")
         case "disconnected":
@@ -121,7 +165,7 @@ ApplicationWindow {
         case "limited": return qsTr("Spotify paused requests. Try again later.")
         case "collection_forbidden": return qsTr("Spotify only shares tracks from playlists you own or collaborate on.")
         case "forbidden": return qsTr("Spotify denied access to this content.")
-        case "ok": return qsTr("This page is empty.")
+        case "ok": return qsTr("This library is empty.")
         default: return qsTr("Could not load your Spotify library.")
         }
     }
@@ -131,17 +175,17 @@ ApplicationWindow {
         enabled: window.canPlay && !keyField.activeFocus
         onActivated: window.backend.togglePlayback()
     }
-    Shortcut { sequence: "Ctrl+1"; enabled: !window.fullscreen; onActivated: window.switchCategory("tracks") }
-    Shortcut { sequence: "Ctrl+2"; enabled: !window.fullscreen; onActivated: window.switchCategory("albums") }
-    Shortcut { sequence: "Ctrl+3"; enabled: !window.fullscreen; onActivated: window.switchCategory("playlists") }
+    Shortcut { sequence: "Ctrl+1"; enabled: !window.nowPlayingExpanded; onActivated: window.switchCategory("tracks") }
+    Shortcut { sequence: "Ctrl+2"; enabled: !window.nowPlayingExpanded; onActivated: window.switchCategory("albums") }
+    Shortcut { sequence: "Ctrl+3"; enabled: !window.nowPlayingExpanded; onActivated: window.switchCategory("playlists") }
     Shortcut {
         sequence: "Ctrl+G"
-        enabled: window.showingGrid && !window.fullscreen
+        enabled: window.showingGrid && !window.nowPlayingExpanded
         onActivated: prefs.compact = !prefs.compact
     }
-    Shortcut { sequence: "Alt+Left"; enabled: window.showingCollection && !window.fullscreen; onActivated: window.backend.back() }
-    Shortcut { sequence: "F11"; onActivated: window.setFullscreen(!window.fullscreen) }
-    Shortcut { sequence: "Escape"; enabled: window.fullscreen; onActivated: window.setFullscreen(false) }
+    Shortcut { sequence: "Alt+Left"; enabled: window.showingCollection && !window.nowPlayingExpanded; onActivated: window.backend.back() }
+    Shortcut { sequence: "F11"; onActivated: window.nowPlayingExpanded = !window.nowPlayingExpanded }
+    Shortcut { sequence: "Escape"; enabled: window.nowPlayingExpanded; onActivated: window.nowPlayingExpanded = false }
     Shortcut { sequences: [StandardKey.Quit]; onActivated: window.close() }
 
     component NavButton: AbstractButton {
@@ -191,7 +235,7 @@ ApplicationWindow {
     ColumnLayout {
         anchors.fill: parent
         spacing: 0
-        visible: !window.fullscreen
+        visible: !window.nowPlayingExpanded
 
         Rectangle {
             Layout.fillWidth: true
@@ -312,17 +356,22 @@ ApplicationWindow {
                     model: !window.showingGrid ? window.backend.entries : null
                     cacheBuffer: 66
                     ScrollBar.vertical: ScrollBar {}
-                    onMovementEnded: window.rememberScroll(rows)
-                    onCountChanged: if (count > 0) window.restoreScroll(rows)
-                    Keys.onReturnPressed: if (currentIndex >= 0) window.activateEntry(window.backend.entries[currentIndex])
-                    Keys.onEnterPressed: if (currentIndex >= 0) window.activateEntry(window.backend.entries[currentIndex])
+                    onContentYChanged: {
+                        window.rememberScroll(rows)
+                        Qt.callLater(window.maybeLoadMore)
+                    }
+                    onCountChanged: Qt.callLater(window.restoreScroll)
+                    onHeightChanged: Qt.callLater(window.maybeLoadMore)
+                    onContentHeightChanged: Qt.callLater(window.maybeLoadMore)
+                    Keys.onReturnPressed: if (currentIndex >= 0 && currentIndex < count) window.activateEntry(window.backend.entryAt(currentIndex))
+                    Keys.onEnterPressed: if (currentIndex >= 0 && currentIndex < count) window.activateEntry(window.backend.entryAt(currentIndex))
 
                     delegate: ItemDelegate {
                         id: entry
 
                         required property int index
-                        required property var modelData
-                        readonly property bool current: window.track.uri === modelData.uri || window.backend.selectedUri === modelData.uri
+                        required property var entryData
+                        readonly property bool current: window.track.uri === entryData.uri || window.backend.selectedUri === entryData.uri
                         readonly property color rowColor: current ? Qt.tint(window.theme.background, Qt.alpha(window.theme.accent, 0.12))
                             : hovered || ListView.isCurrentItem && rows.activeFocus ? window.surface : window.theme.background
 
@@ -330,12 +379,12 @@ ApplicationWindow {
                         height: 55
                         padding: 6
                         hoverEnabled: true
-                        Accessible.name: [modelData.title, modelData.subtitle].filter(Boolean).join(", ")
+                        Accessible.name: [entryData.title, entryData.subtitle].filter(Boolean).join(", ")
                         onClicked: {
                             window.rememberScroll(rows)
                             rows.currentIndex = index
                             rows.forceActiveFocus()
-                            window.activateEntry(modelData)
+                            window.activateEntry(entryData)
                         }
 
                         background: Rectangle {
@@ -361,7 +410,7 @@ ApplicationWindow {
                                 Layout.preferredWidth: 42
                                 Layout.preferredHeight: 42
                                 glyph: window.showingLists ? "playlist" : "note"
-                                source: entry.modelData.art || ""
+                                source: entry.entryData.art || ""
                                 ink: window.theme.foreground
                                 surround: entry.rowColor
                             }
@@ -370,7 +419,7 @@ ApplicationWindow {
                                 spacing: 2
                                 Label {
                                     Layout.fillWidth: true
-                                    text: entry.modelData.title || ""
+                                    text: entry.entryData.title || ""
                                     textFormat: Text.PlainText
                                     elide: Text.ElideRight
                                     color: entry.current ? window.theme.accent : window.theme.foreground
@@ -379,14 +428,14 @@ ApplicationWindow {
                                 }
                                 PageLabel {
                                     Layout.fillWidth: true
-                                    text: entry.modelData.subtitle || ""
+                                    text: entry.entryData.subtitle || ""
                                     visible: text !== ""
                                 }
                             }
                             PageLabel {
                                 Layout.rightMargin: 6
-                                visible: !!entry.modelData.duration
-                                text: window.timeText(entry.modelData.duration || 0)
+                                visible: !!entry.entryData.duration
+                                text: window.timeText(entry.entryData.duration || 0)
                             }
                             MediaIcon {
                                 Layout.rightMargin: 6
@@ -410,17 +459,22 @@ ApplicationWindow {
                     cellWidth: Math.floor((width - 9) / Math.max(1, Math.floor((width - 9) / (prefs.compact ? 105 : 132))))
                     cellHeight: cellWidth + (prefs.compact ? 0 : 43)
                     ScrollBar.vertical: ScrollBar {}
-                    onMovementEnded: window.rememberScroll(albums)
-                    onCellHeightChanged: if (visible && count > 0) window.restoreScroll(albums)
-                    onCountChanged: if (count > 0) window.restoreScroll(albums)
-                    Keys.onReturnPressed: if (currentIndex >= 0) window.activateEntry(window.backend.entries[currentIndex])
-                    Keys.onEnterPressed: if (currentIndex >= 0) window.activateEntry(window.backend.entries[currentIndex])
+                    onContentYChanged: {
+                        window.rememberScroll(albums)
+                        Qt.callLater(window.maybeLoadMore)
+                    }
+                    onCellHeightChanged: if (visible && count > 0) window.scheduleRestore()
+                    onCountChanged: Qt.callLater(window.restoreScroll)
+                    onHeightChanged: Qt.callLater(window.maybeLoadMore)
+                    onContentHeightChanged: Qt.callLater(window.maybeLoadMore)
+                    Keys.onReturnPressed: if (currentIndex >= 0 && currentIndex < count) window.activateEntry(window.backend.entryAt(currentIndex))
+                    Keys.onEnterPressed: if (currentIndex >= 0 && currentIndex < count) window.activateEntry(window.backend.entryAt(currentIndex))
 
                     delegate: ItemDelegate {
                         id: tile
 
                         required property int index
-                        required property var modelData
+                        required property var entryData
                         readonly property bool selected: GridView.isCurrentItem && albums.activeFocus
                         readonly property color tileColor: hovered || selected ? window.surface : window.theme.background
 
@@ -428,7 +482,7 @@ ApplicationWindow {
                         height: albums.cellHeight - 4
                         padding: 4
                         hoverEnabled: true
-                        Accessible.name: [modelData.title, modelData.subtitle].filter(Boolean).join(", ")
+                        Accessible.name: [entryData.title, entryData.subtitle].filter(Boolean).join(", ")
                         ToolTip.visible: hovered && prefs.compact
                         ToolTip.delay: 450
                         ToolTip.text: Accessible.name
@@ -436,7 +490,7 @@ ApplicationWindow {
                             window.rememberScroll(albums)
                             albums.currentIndex = index
                             albums.forceActiveFocus()
-                            window.activateEntry(modelData)
+                            window.activateEntry(entryData)
                         }
 
                         background: Rectangle {
@@ -452,7 +506,7 @@ ApplicationWindow {
                                 Layout.fillWidth: true
                                 Layout.preferredHeight: albums.cellWidth - 12
                                 glyph: "album"
-                                source: (width * Screen.devicePixelRatio > 260 ? tile.modelData.artHigh : tile.modelData.art) || ""
+                                source: (width * Screen.devicePixelRatio > 260 ? tile.entryData.artHigh : tile.entryData.art) || ""
                                 decodeSize: width * Screen.devicePixelRatio > 260 ? 512 : 256
                                 ink: window.theme.foreground
                                 surround: tile.tileColor
@@ -461,7 +515,7 @@ ApplicationWindow {
                                 Layout.fillWidth: true
                                 Layout.topMargin: 3
                                 visible: !prefs.compact
-                                text: tile.modelData.title || ""
+                                text: tile.entryData.title || ""
                                 textFormat: Text.PlainText
                                 elide: Text.ElideRight
                                 font.pixelSize: 13
@@ -470,7 +524,7 @@ ApplicationWindow {
                             PageLabel {
                                 Layout.fillWidth: true
                                 visible: !prefs.compact
-                                text: tile.modelData.subtitle || ""
+                                text: tile.entryData.subtitle || ""
                             }
                         }
                     }
@@ -479,7 +533,7 @@ ApplicationWindow {
                 ColumnLayout {
                     anchors.centerIn: parent
                     width: Math.min(parent.width - 24, 410)
-                    visible: window.backend.entries.length === 0 || window.backend.libraryStatus !== "ok"
+                    visible: (window.showingGrid ? albums.count : rows.count) === 0
                     spacing: 12
 
                     PageLabel {
@@ -493,38 +547,36 @@ ApplicationWindow {
                         Layout.alignment: Qt.AlignHCenter
                         text: qsTr("Connect Spotify")
                         visible: window.canConnect
-                        enabled: !window.backend.webBusy
+                        enabled: !window.backend.webBusy && !window.backend.webCoolingDown
                         onClicked: window.backend.connectLibrary()
                     }
                     Button {
                         Layout.alignment: Qt.AlignHCenter
                         text: qsTr("Retry")
                         visible: ["unavailable", "forbidden", "action_failed", "quota", "limited"].includes(window.backend.libraryStatus)
-                        enabled: !window.backend.webBusy
+                        enabled: !window.backend.webBusy && !window.backend.webCoolingDown
                         onClicked: window.backend.retryLibrary()
                     }
                 }
             }
 
             RowLayout {
-                Layout.alignment: Qt.AlignRight
-                visible: window.backend.offset > 0 || window.backend.nextOffset >= 0
-                spacing: 2
+                Layout.fillWidth: true
+                visible: (window.showingGrid ? albums.count : rows.count) > 0
+                    && window.backend.libraryStatus !== "ok"
+                spacing: 8
 
-                RowButton {
-                    diameter: 28
-                    text: qsTr("Previous page")
-                    glyph: "back"
-                    enabled: window.backend.offset > 0 && window.backend.libraryStatus !== "loading"
-                    onClicked: window.backend.loadPage(Math.max(0, window.backend.offset - 20))
+                PageLabel {
+                    Layout.fillWidth: true
+                    text: window.backend.libraryStatus === "loadingMore" ? qsTr("Loading more…")
+                        : window.backend.libraryStatus === "connecting" ? window.libraryMessage("connecting")
+                        : qsTr("Could not load more.") + " " + window.libraryMessage(window.backend.libraryStatus)
                 }
-                PageLabel { text: String(Math.floor(window.backend.offset / 20) + 1) }
-                RowButton {
-                    diameter: 28
-                    text: qsTr("Next page")
-                    glyph: "forward"
-                    enabled: window.backend.nextOffset >= 0
-                    onClicked: window.backend.loadPage(window.backend.nextOffset)
+                Button {
+                    text: window.canConnect ? qsTr("Connect Spotify") : qsTr("Retry")
+                    visible: !["loadingMore", "connecting"].includes(window.backend.libraryStatus)
+                    enabled: !window.backend.webBusy && !window.backend.webCoolingDown
+                    onClicked: window.canConnect ? window.backend.connectLibrary() : window.backend.retryLibrary()
                 }
             }
         }
@@ -547,6 +599,14 @@ ApplicationWindow {
                 RowLayout {
                     Layout.fillWidth: true
 
+                    Artwork {
+                        visible: window.backend.selectionStatus === "inspecting"
+                        Layout.preferredWidth: 42
+                        Layout.preferredHeight: 42
+                        source: window.backend.selection.art || ""
+                        ink: window.theme.foreground
+                        surround: window.surface
+                    }
                     ColumnLayout {
                         Layout.fillWidth: true
                         spacing: 2
@@ -555,12 +615,16 @@ ApplicationWindow {
                             Layout.fillWidth: true
                             visible: window.backend.selectionStatus !== ""
                             color: window.theme.accent
-                            text: window.backend.selection.title || qsTr("Selected track")
+                            text: window.backend.selection.title || (window.backend.selectionStatus === "inspecting"
+                                ? (window.backend.selectionLoading ? qsTr("Loading track…") : qsTr("Track details unavailable"))
+                                : qsTr("Selected track"))
                         }
                         PageLabel {
                             Layout.fillWidth: true
                             wrapMode: Text.WordWrap
                             text: {
+                                if (window.backend.selectionStatus === "inspecting")
+                                    return window.backend.selection.subtitle || ""
                                 if (window.backend.selectionStatus === "failed")
                                     return qsTr("Soloist could not perform that action.")
                                 if (window.backend.selectionStatus === "waiting" && window.track.ready)
@@ -573,7 +637,7 @@ ApplicationWindow {
                     RowButton {
                         diameter: 28
                         glyph: "close"
-                        text: qsTr("Dismiss playback request")
+                        text: window.backend.selectionStatus === "inspecting" ? qsTr("Dismiss track details") : qsTr("Dismiss playback request")
                         visible: window.backend.selectionStatus !== ""
                         onClicked: window.backend.dismissSelection()
                     }
@@ -645,7 +709,7 @@ ApplicationWindow {
                         spacing: 3
                         Label {
                             Layout.fillWidth: true
-                            text: window.track.title || qsTr("Nothing is playing")
+                            text: window.trackTitle
                             textFormat: Text.PlainText
                             elide: Text.ElideRight
                             font.pixelSize: 13
@@ -679,13 +743,13 @@ ApplicationWindow {
                     RowButton {
                         glyph: window.backend.favorite === 1 ? "saved" : "add"
                         text: window.backend.favorite === 1 ? qsTr("Remove from Liked Songs") : qsTr("Save to Liked Songs")
-                        enabled: window.backend.favorite >= 0 && !window.backend.webBusy
+                        enabled: window.backend.favorite >= 0 && !window.backend.webBusy && !window.backend.webCoolingDown
                         onClicked: window.backend.toggleFavorite()
                     }
                     RowButton {
                         glyph: "expand"
-                        text: qsTr("Fullscreen")
-                        onClicked: window.setFullscreen(true)
+                        text: qsTr("Now Playing")
+                        onClicked: window.nowPlayingExpanded = true
                     }
                 }
             }
@@ -694,12 +758,13 @@ ApplicationWindow {
 
     Loader {
         anchors.fill: parent
-        active: window.fullscreen
+        active: window.nowPlayingExpanded
         focus: active
         sourceComponent: NowPlaying {
             backend: window.backend
             theme: window.theme
-            onExitRequested: window.setFullscreen(false)
+            displayTitle: window.trackTitle
+            onExitRequested: window.nowPlayingExpanded = false
         }
     }
 }

@@ -44,6 +44,15 @@ if(BUILD_TESTING)
     target_include_directories(playback-test PRIVATE src)
     target_link_libraries(playback-test PRIVATE Qt6::Test)
     add_test(NAME playback-test COMMAND playback-test)
+    qt_add_executable(backend-test tests/backend_test.cpp src/backend.cpp src/backend.h src/playback.cpp)
+    target_include_directories(backend-test PRIVATE src)
+    target_link_libraries(backend-test PRIVATE Qt6::Test Qt6::Qml)
+    target_compile_definitions(backend-test PRIVATE
+        PYTHON_EXECUTABLE="${Python3_EXECUTABLE}"
+        FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixture.py"
+    )
+    qt_add_resources(backend-test "test-spotify-helper" PREFIX "/" FILES ../spotify.py)
+    add_test(NAME backend-test COMMAND backend-test)
     add_test(NAME routing-test COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/routing_test.py $<TARGET_FILE:omarchy-spotify>)
 endif()

@@ -11,9 +11,7 @@
   "albums": "Albums",
   "playlists": "Playlists",
   "libraryLoading": "Loading your library…",
-  "libraryEmpty": "No items on this page.",
-  "previousPage": "Previous page",
-  "nextPage": "Next page",
+  "libraryEmpty": "This library is empty.",
   "previous": "Previous track",
   "next": "Next track",
   "play": "Play",
@@ -31,7 +29,6 @@
   "paused": "Paused",
   "pausedOn": "Paused on %1",
   "time": "%1 / %2",
-  "openSpotify": "Open in Spotify",
   "retry": "Retry",
   "denied": "Spotify access was declined.",
   "auth_timeout": "The Spotify sign-in timed out.",
@@ -46,5 +43,8 @@
   "track": "",
   "openDesktop": "Open desktop player",
   "desktop_missing": "Install the Omarchy Spotify desktop player first.",
-  "desktop_failed": "Could not open the desktop player."
+  "desktop_failed": "Could not open the desktop player.",
+  "openTrack": "Open track",
+  "libraryLoadingMore": "Loading more…",
+  "libraryMoreError": "Could not load more."
 }

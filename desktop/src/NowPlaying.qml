@@ -10,15 +10,16 @@ FocusScope {
 
     required property Backend backend
     required property Theme theme
+    required property string displayTitle
     signal exitRequested()
 
     readonly property var track: backend.playback
-    readonly property bool wide: width >= 800 && width >= height * 1.2
+    readonly property bool wide: width >= 680 && width >= height * 1.2
     readonly property color baseColor: "#101318"
     readonly property color ink: "#f6f7fa"
     readonly property color accent: theme.light ? Qt.lighter(theme.accent, 1.35) : theme.accent
-    readonly property real artSide: Math.max(70, wide ? Math.min(width * 0.41, height * 0.72, 480)
-                                                     : Math.min(width * 0.68, height * 0.46, 400))
+    readonly property real artSide: wide ? Math.min(width * 0.42, height * 0.75, 480)
+        : Math.max(56, Math.min(width * 0.68, height * 0.48, height - details.implicitHeight - 100, 400))
 
     Rectangle { anchors.fill: parent; color: stage.baseColor }
 
@@ -50,7 +51,7 @@ FocusScope {
         anchors.right: parent.right
         anchors.margins: 22
         glyph: "collapse"
-        text: qsTr("Exit fullscreen")
+        text: qsTr("Back to library")
         foreground: stage.ink
         emphasis: stage.accent
         diameter: 44
@@ -77,13 +78,15 @@ FocusScope {
         }
 
         ColumnLayout {
+            id: details
+
             Layout.fillWidth: true
             spacing: stage.height >= 650 ? 13 : 7
 
             Label {
                 Layout.fillWidth: true
                 horizontalAlignment: stage.wide ? Text.AlignLeft : Text.AlignHCenter
-                text: stage.track.title || qsTr("Nothing is playing")
+                text: stage.displayTitle
                 textFormat: Text.PlainText
                 color: stage.ink
                 font.pixelSize: stage.wide ? Math.min(54, stage.width * 0.045) : Math.min(36, stage.width * 0.06)

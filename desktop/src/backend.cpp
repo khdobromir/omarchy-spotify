@@ -4,14 +4,18 @@
 #include <QDir>
 #include <QJsonArray>
 #include <QJsonDocument>
+#include <QLoggingCategory>
 #include <QSaveFile>
 #include <QStandardPaths>
 
 #include <algorithm>
-#include <chrono>
+#include <memory>
 #include <utility>
 
 namespace {
+Q_LOGGING_CATEGORY(metadataLog, "omarchy.spotify.metadata", QtWarningMsg)
+constexpr int maxLibraryOffset = 100'000;
+
 QByteArray readSmall(const QString &path, qint64 limit = 8192) {
     QFile file(path);
     if (!file.open(QIODevice::ReadOnly))
@@ -25,6 +29,34 @@ QString trackId(const Playback &playback) {
 }
 }
 
+int LibraryModel::rowCount(const QModelIndex &parent) const {
+    return parent.isValid() ? 0 : int(m_items.size());
+}
+
+QVariant LibraryModel::data(const QModelIndex &index, int role) const {
+    return index.isValid() && role == Qt::UserRole ? m_items.value(index.row()) : QVariant{};
+}
+
+QHash<int, QByteArray> LibraryModel::roleNames() const {
+    static const QHash<int, QByteArray> roles{{Qt::UserRole, "entryData"}};
+    return roles;
+}
+
+void LibraryModel::replace(QVariantList items) {
+    beginResetModel();
+    m_items = std::move(items);
+    endResetModel();
+}
+
+void LibraryModel::append(const QVariantList &items) {
+    if (items.isEmpty())
+        return;
+    const int first = rowCount();
+    beginInsertRows({}, first, first + int(items.size()) - 1);
+    m_items.append(items);
+    endInsertRows();
+}
+
 Backend::Backend(QObject *parent)
     : QObject(parent), m_home(QStandardPaths::writableLocation(QStandardPaths::StateLocation)),
       m_dataDir(m_home + "/soloist"), m_keyFile(m_home + "/soloist-key"),
@@ -34,7 +66,6 @@ Backend::Backend(QObject *parent)
     m_trace.setStandardErrorFile(QProcess::nullDevice());
     m_control.setStandardOutputFile(QProcess::nullDevice());
     m_control.setStandardErrorFile(QProcess::nullDevice());
-    m_web.setStandardErrorFile(QProcess::nullDevice());
 
     m_startup.setSingleShot(true);
     m_startup.setInterval(15000);
@@ -78,13 +109,22 @@ Backend::Backend(QObject *parent)
         if (error == QProcess::FailedToStart)
             controlFinished(false);
     });
-    connect(&m_web, &QProcess::finished, this, [this](int, QProcess::ExitStatus) {
-        const QJsonDocument response = QJsonDocument::fromJson(m_web.readAllStandardOutput());
-        webFinished(response.isObject() ? response.object() : QJsonObject{});
-    });
-    connect(&m_web, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
-        if (error == QProcess::FailedToStart)
-            webFinished({});
+    for (WebJob *job : {&m_web, &m_trackWeb}) {
+        job->process.setStandardErrorFile(QProcess::nullDevice());
+        connect(&job->process, &QProcess::finished, this, [this, job](int, QProcess::ExitStatus) {
+            const QJsonDocument response = QJsonDocument::fromJson(job->process.readAllStandardOutput());
+            webFinished(*job, response.isObject() ? response.object() : QJsonObject{});
+        });
+        connect(&job->process, &QProcess::errorOccurred, this, [this, job](QProcess::ProcessError error) {
+            if (error == QProcess::FailedToStart)
+                webFinished(*job, {});
+        });
+    }
+    m_webCooldown.setSingleShot(true);
+    m_webCooldown.setTimerType(Qt::PreciseTimer);
+    connect(&m_webCooldown, &QTimer::timeout, this, [this] {
+        emit libraryChanged();
+        loadPending();
     });
 
     QFile source(":/spotify.py");
@@ -100,7 +140,7 @@ Backend::Backend(QObject *parent)
 }
 
 Backend::~Backend() {
-    for (QProcess *process : {&m_control, &m_trace, &m_daemon, &m_web}) {
+    for (QProcess *process : {&m_control, &m_trace, &m_daemon, &m_web.process, &m_trackWeb.process}) {
         process->disconnect(this);
         if (process->state() != QProcess::NotRunning) {
             process->terminate();
@@ -114,6 +154,10 @@ Backend::~Backend() {
 
 QVariantMap Backend::playback() const {
     return {{"ready", m_playback.loggedIn}, {"playing", m_playback.status == "playing"},
+            {"idle", m_playback.status == "idle"},
+            {"loadingMetadata", m_playback.needsMetadata()
+                && (!m_metadataAttempted || (!m_trackWeb.operation.isEmpty()
+                                           && m_webMetadataGeneration == m_metadataGeneration))},
             {"uri", m_playback.uri}, {"title", m_playback.title}, {"artist", m_playback.artist}, {"album", m_playback.album},
             {"art", m_playback.art}, {"artHigh", m_playback.artHigh}, {"duration", m_playback.duration}};
 }
@@ -192,6 +236,7 @@ void Backend::tryTrace() {
 }
 
 void Backend::readTrace() {
+    const QString previousUri = m_playback.uri;
     bool changed = false;
     while (m_trace.canReadLine())
         changed |= m_playback.apply(m_trace.readLine(), QDateTime::currentMSecsSinceEpoch());
@@ -206,18 +251,22 @@ void Backend::readTrace() {
     } else {
         m_tick.stop();
     }
-    if (m_checkedTrack != trackId(m_playback)) {
+    refreshMetadata();
+    if (previousUri != m_playback.uri) {
+        m_checkedTrack.clear();
         m_favorite = -1;
         emit libraryChanged();
     }
-    emit playbackChanged();
-    emit positionChanged();
-    if (!m_selectedUri.isEmpty() && m_playback.uri == m_selectedUri && m_pendingPlay.isEmpty()) {
+    if (!m_selectedUri.isEmpty() && m_playback.uri == m_selectedUri && m_pendingPlay.isEmpty()
+        && m_selectionStatus != "inspecting") {
         m_selectionStatus.clear();
         m_lookupSelection = false;
         emit playerChanged();
     }
     playPending();
+    loadPending();
+    emit playbackChanged();
+    emit positionChanged();
     checkFavorite();
 }
 
@@ -227,6 +276,7 @@ void Backend::playerStopped(const QString &status) {
     if (m_trace.state() != QProcess::NotRunning)
         m_trace.terminate();
     m_playback = {};
+    refreshMetadata();
     m_checkedTrack.clear();
     m_favorite = -1;
     setPlayerStatus(status);
@@ -263,7 +313,7 @@ void Backend::openUri(const QString &uri) {
         openCollection(uri);
     } else {
         if (m_category != "tracks" || !m_collectionUri.isEmpty())
-            loadLibrary("tracks", 0);
+            loadLibrary("tracks");
         play(uri);
         if (uri.startsWith("spotify:track:") && m_selection.isEmpty() && m_selectionStatus != "") {
             m_lookupSelection = true;
@@ -272,21 +322,50 @@ void Backend::openUri(const QString &uri) {
     }
 }
 
+void Backend::openTrack(const QString &uri) {
+    if (!uri.startsWith("spotify:track:") || !Playback::playableUri(uri) || uri == m_playback.uri)
+        return;
+    m_selectedUri = uri;
+    m_selection = m_metadata.contains(uri) ? m_metadata.object(uri)->toVariantMap() : QVariantMap{};
+    m_selectionStatus = "inspecting";
+    m_lookupSelection = m_selection.isEmpty();
+    updateSelection();
+    loadPending();
+    emit playerChanged();
+}
+
+void Backend::refreshMetadata() {
+    if (m_metadataUri == m_playback.uri)
+        return;
+    m_metadataUri = m_playback.uri;
+    ++m_metadataGeneration;
+    m_metadataAttempted = false;
+    m_metadataRetried = false;
+    if (const auto *cached = m_metadata.object(m_metadataUri)) {
+        m_playback.mergeMetadata(*cached);
+        m_metadataAttempted = true;
+    }
+}
+
 void Backend::playPending() {
     if (m_pendingPlay.isEmpty() || commandBusy() || !m_playback.loggedIn)
         return;
     m_activePlay = std::exchange(m_pendingPlay, {});
-    m_selectionStatus = "sent";
-    emit playerChanged();
+    if (m_selectionStatus != "inspecting") {
+        m_selectionStatus = "sent";
+        emit playerChanged();
+    }
     command({"play", m_activePlay});
 }
 
 void Backend::controlFinished(bool success) {
     if (!success) {
         setPlayerStatus("player_command");
-        if (!m_activePlay.isEmpty() && m_activePlay == m_selectedUri && m_pendingPlay.isEmpty())
+        if (!m_activePlay.isEmpty() && m_activePlay == m_selectedUri && m_pendingPlay.isEmpty()
+            && m_selectionStatus != "inspecting")
             m_selectionStatus = "failed";
-    } else if (m_activePlay == m_selectedUri && m_pendingPlay.isEmpty()) {
+    } else if (m_activePlay == m_selectedUri && m_pendingPlay.isEmpty()
+            && m_selectionStatus != "inspecting") {
         m_selectionStatus.clear();
     }
     m_activePlay.clear();
@@ -295,7 +374,8 @@ void Backend::controlFinished(bool success) {
 }
 
 void Backend::dismissSelection() {
-    m_pendingPlay.clear();
+    if (m_selectionStatus != "inspecting")
+        m_pendingPlay.clear();
     m_selectedUri.clear();
     m_selectionStatus.clear();
     m_lookupSelection = false;
@@ -304,10 +384,17 @@ void Backend::dismissSelection() {
     emit playerChanged();
 }
 
+bool Backend::selectionLoading() const {
+    return m_lookupSelection || (!m_trackWeb.operation.isEmpty()
+        && m_selectedUri == "spotify:" + m_trackWeb.operation + ':' + m_trackWeb.arguments.value(0));
+}
+
 void Backend::updateSelection() {
+    if (m_selectedUri.isEmpty())
+        return;
     if (m_selectedUri == m_collectionUri)
-        m_selection = m_collection;
-    for (const QVariant &entry : m_entries) {
+        m_selection = m_context.collection;
+    for (const QVariant &entry : m_entries.items()) {
         const QVariantMap metadata = entry.toMap();
         if (metadata.value("uri") == m_selectedUri) {
             m_selection = metadata;
@@ -335,115 +422,170 @@ void Backend::seek(int at, const QString &uri) {
 }
 
 bool Backend::webRequest(const QString &operation, const QStringList &args) {
-    if (webBusy() || !m_backoff.hasExpired())
+    WebJob &job = operation == "track" || operation == "episode" ? m_trackWeb : m_web;
+    if (!job.operation.isEmpty() || webCoolingDown())
         return false;
-    if (m_helper.fileName().isEmpty() || m_helper.isOpen()) {
-        m_libraryStatus = "unavailable";
+    if (m_helper.fileName().isEmpty() || m_helper.isOpen())
+        return false;
+    job.operation = operation;
+    job.arguments = args;
+    job.process.start("python3", QStringList{"-B", m_helper.fileName(), operation} + args);
+    if (&job == &m_web)
         emit libraryChanged();
-        return false;
-    }
-    m_webOperation = operation;
-    m_webArguments = args;
-    m_web.start("python3", QStringList{"-B", m_helper.fileName(), operation} + args);
-    emit libraryChanged();
     return true;
 }
 
-void Backend::loadLibrary(const QString &kind, int page) {
-    if (kind != "tracks" && kind != "albums" && kind != "playlists")
-        return;
-    m_collectionUri.clear();
-    m_collection.clear();
-    m_category = kind;
-    navigate(page);
+void Backend::loadLibrary(const QString &kind) {
+    if (kind == "tracks" || kind == "albums" || kind == "playlists")
+        navigate(kind);
 }
 
 void Backend::openCollection(const QString &uri, const QVariantMap &metadata) {
     if (!Playback::playableUri(uri))
         return;
-    const bool album = uri.startsWith("spotify:album:");
-    if (!album && !uri.startsWith("spotify:playlist:"))
-        return;
-    if (m_collectionUri == uri && m_offset == 0 && m_libraryStatus == "ok")
-        return;
-    const QString category = album ? "albums" : "playlists";
-    if (m_category != category)
-        m_rootOffset = 0;
-    m_category = category;
-    m_collectionUri = uri;
-    m_collection = metadata;
-    navigate(0);
+    if (uri.startsWith("spotify:album:"))
+        navigate("albums", uri, metadata);
+    else if (uri.startsWith("spotify:playlist:"))
+        navigate("playlists", uri, metadata);
 }
 
 void Backend::back() {
     if (!m_collectionUri.isEmpty())
-        loadLibrary(m_category, m_rootOffset);
+        navigate(m_category);
 }
 
-void Backend::loadPage(int offset) {
-    navigate(offset);
-}
-
-void Backend::retryLibrary() {
-    navigate(m_offset, true);
-}
-
-QString Backend::pageKey() const {
-    return (m_collectionUri.isEmpty() ? m_category : m_collectionUri) + '/' + QString::number(m_offset);
-}
-
-void Backend::navigate(int offset, bool refresh) {
-    if (offset < 0 || offset > 100'000 || offset % 20 != 0)
+void Backend::loadMore() {
+    if (m_context.status != "ok" || m_context.next < 0)
         return;
-    m_offset = offset;
-    if (m_collectionUri.isEmpty())
-        m_rootOffset = offset;
-    const QString key = pageKey();
-    if (const auto *cached = m_pages.object(key); !refresh && cached && !cached->expires.hasExpired()) {
-        m_loadPending = false;
-        applyPage(cached->data);
-        return;
-    }
-    m_pages.remove(key);
-    m_loadPending = true;
-    m_nextOffset = -1;
-    m_entries.clear();
-    m_libraryStatus = "loading";
+    m_context.status = "loadingMore";
+    m_context.pending = true;
     emit libraryChanged();
-    emit entriesChanged();
     loadPending();
 }
 
-void Backend::applyPage(const QJsonObject &result) {
-    m_libraryStatus = result.value("status").toString("unavailable");
-    m_entries = result.value("items").toArray().toVariantList();
-    m_nextOffset = result.value("next").toInt(-1);
-    if (result.value("collection").isObject())
-        m_collection = result.value("collection").toObject().toVariantMap();
+void Backend::retryLibrary() {
+    if (webCoolingDown() || m_context.next < 0
+        || m_context.status == "loading" || m_context.status == "loadingMore" || m_context.status == "ok")
+        return;
+    m_context.status = m_entries.rowCount() > 0 ? "loadingMore" : "loading";
+    m_context.pending = true;
+    emit libraryChanged();
+    loadPending();
+}
+
+void Backend::navigate(const QString &category, const QString &uri, const QVariantMap &metadata) {
+    if (category == m_category && uri == m_collectionUri)
+        return;
+    m_context.items = m_entries.items();
+    if (m_collectionUri.isEmpty()) {
+        m_roots.insert(m_category, std::move(m_context));
+    } else {
+        const auto cost = std::max<qsizetype>(80, m_context.items.size());
+        m_collections.insert(m_collectionUri, new LibraryContext(std::move(m_context)), cost);
+    }
+
+    m_category = category;
+    m_collectionUri = uri;
+    const std::unique_ptr<LibraryContext> cached(uri.isEmpty() ? nullptr : m_collections.take(uri));
+    if (cached) {
+        m_context = std::move(*cached);
+    } else if (uri.isEmpty() && m_roots.contains(category)) {
+        m_context = m_roots.take(category);
+    } else {
+        m_context = {};
+        m_context.generation = ++m_libraryGeneration;
+        m_context.collection = metadata;
+    }
+    m_entries.replace(std::exchange(m_context.items, {}));
     updateSelection();
     emit libraryChanged();
-    emit entriesChanged();
+    emit libraryContextChanged();
+    loadPending();
+}
+
+void Backend::reloadLibrary() {
+    const auto collection = std::move(m_context.collection);
+    const double scroll = m_context.scroll;
+    m_context = {};
+    m_context.generation = ++m_libraryGeneration;
+    m_context.collection = collection;
+    m_context.scroll = scroll;
+    m_entries.replace({});
+    emit libraryChanged();
+    emit libraryContextChanged();
+}
+
+void Backend::applyPage(LibraryContext &context, const QJsonObject &result) {
+    context.pending = false;
+    context.status = result.value("status").toString("unavailable");
+    if (result.value("collection").isObject())
+        context.collection = result.value("collection").toObject().toVariantMap();
+    if (context.status != "ok")
+        return;
+    if (!result.value("items").isArray()) {
+        context.status = "unavailable";
+        return;
+    }
+    const int next = result.value("next").toInt(-1);
+    context.next = next > context.next && next <= maxLibraryOffset ? next : -1;
+    const auto items = result.value("items").toArray().toVariantList();
+    if (&context == &m_context) {
+        m_entries.append(items);
+        updateSelection();
+    } else {
+        context.items.append(items);
+    }
+}
+
+void Backend::loadMetadata() {
+    if (webCoolingDown())
+        return;
+    if (!m_trackWeb.operation.isEmpty()) {
+        const QString requested = "spotify:" + m_trackWeb.operation + ':' + m_trackWeb.arguments.value(0);
+        if (m_webMetadataGeneration != 0 && requested != m_playback.uri
+            && m_playback.needsMetadata() && !m_metadataAttempted && requested != m_selectedUri) {
+            qCDebug(metadataLog) << "Cancelled superseded track request" << requested;
+            m_trackWeb.process.kill();
+        }
+        return;
+    }
+    if (m_playback.needsMetadata() && !m_metadataAttempted) {
+        m_metadataAttempted = true;
+        m_webMetadataGeneration = m_metadataGeneration;
+        const QString kind = m_playback.uri.section(':', 1, 1);
+        if (webRequest(kind, {m_playback.uri.section(':', 2, 2)})) {
+            qCDebug(metadataLog) << "Requested current track metadata" << m_playback.uri;
+            return;
+        }
+    }
+    if (m_lookupSelection && m_selectedUri.startsWith("spotify:track:")) {
+        m_webMetadataGeneration = 0;
+        m_lookupSelection = false;
+        // The same URI is already pending or has been tried for the active track.
+        if (m_selectedUri != m_playback.uri)
+            webRequest("track", {m_selectedUri.mid(14)});
+        emit selectionChanged();
+    }
 }
 
 void Backend::loadPending() {
-    if (m_loadPending) {
-        if (webBusy())
-            return;
-        const bool detail = !m_collectionUri.isEmpty();
-        m_loadPending = false;
-        if (webRequest(detail ? "collection" : "library",
-                       {detail ? m_collectionUri : m_category, QString::number(m_offset)}))
-            return;
-        m_libraryStatus = m_backoff.hasExpired() ? "unavailable" : "limited";
-        emit libraryChanged();
-    }
-    if (m_lookupSelection && webRequest("track", {m_selectedUri.mid(14)}))
-        m_lookupSelection = false;
+    loadMetadata();
+    if (webBusy())
+        return;
+    if (!m_context.pending)
+        return;
+    const bool detail = !m_collectionUri.isEmpty();
+    m_context.pending = false;
+    m_webLibraryGeneration = m_context.generation;
+    if (webRequest(detail ? "collection" : "library", {libraryContext(), QString::number(m_context.next)}))
+        return;
+    m_context.status = webCoolingDown() ? "limited" : "unavailable";
+    emit libraryChanged();
 }
 
 void Backend::connectLibrary() {
     if (webRequest("connect")) {
-        m_libraryStatus = "connecting";
+        m_context.status = "connecting";
         emit libraryChanged();
     }
 }
@@ -456,53 +598,86 @@ void Backend::toggleFavorite() {
 
 void Backend::checkFavorite() {
     const QString id = trackId(m_playback);
-    if (m_libraryStatus == "ok" && !id.isEmpty() && m_checkedTrack != id
+    if (m_context.next != 0 && !id.isEmpty() && m_checkedTrack != id
         && webRequest("favorite", {id}))
         m_checkedTrack = id;
 }
 
-void Backend::webFinished(const QJsonObject &result) {
-    const QString operation = std::exchange(m_webOperation, {});
-    const QStringList arguments = std::exchange(m_webArguments, {});
+void Backend::webFinished(WebJob &job, const QJsonObject &result) {
+    const QString operation = std::exchange(job.operation, {});
+    const QStringList arguments = std::exchange(job.arguments, {});
     const QString status = result.value("status").toString("unavailable");
-    if (status == "disconnected" || status == "reauthorize")
-        m_pages.clear();
+    if (&job == &m_web && (status == "disconnected" || status == "reauthorize")) {
+        m_roots.clear();
+        m_collections.clear();
+    }
     const qint64 retry = result.value("retry").toInteger();
-    if (retry > 0)
-        m_backoff = QDeadlineTimer(std::min(retry, qint64{86400}) * 1000);
-    if (operation == "library" || operation == "collection") {
-        const QString key = arguments.value(0) + '/' + arguments.value(1);
-        if (status == "ok")
-            m_pages.insert(key, new LibraryPage{QDeadlineTimer(std::chrono::minutes(3)), result});
-        if (key == pageKey()) {
-            m_loadPending = false;
-            applyPage(result);
+    if (retry > 0 && (status == "limited" || status == "quota")) {
+        const int milliseconds = int((std::min)(retry, qint64{86400}) * 1000);
+        if (milliseconds > m_backoff.remainingTime()) {
+            m_backoff = QDeadlineTimer(milliseconds, Qt::PreciseTimer);
+            m_webCooldown.start(milliseconds);
         }
-    } else if (operation == "track") {
-        const QVariantMap metadata = result.value("track").toObject().toVariantMap();
-        if (metadata.value("uri") == m_selectedUri) {
-            m_selection = metadata;
+    }
+    if (operation == "library" || operation == "collection") {
+        const QString key = arguments.value(0);
+        LibraryContext *context = nullptr;
+        if (key == libraryContext()) {
+            context = &m_context;
+        } else if (auto root = m_roots.find(key); root != m_roots.end()) {
+            context = &root.value();
+        } else {
+            context = m_collections.object(key);
+        }
+        if (context && context->generation == m_webLibraryGeneration)
+            applyPage(*context, result);
+    } else if (operation == "track" || operation == "episode") {
+        const QString expected = "spotify:" + operation + ':' + arguments.value(0);
+        const QJsonObject metadata = result.value("track").toObject();
+        const bool current = expected == m_playback.uri && m_webMetadataGeneration == m_metadataGeneration;
+        if (status == "ok" && metadata.value("uri").toString() == expected) {
+            m_metadata.insert(expected, new QJsonObject(metadata));
+            if (current) {
+                m_playback.mergeMetadata(metadata);
+            } else {
+                qCDebug(metadataLog) << "Discarded response for previous playback generation" << expected;
+                // A → B → A can reuse the validated entry without starting a second request for A.
+                if (expected == m_playback.uri && m_playback.needsMetadata()) {
+                    m_playback.mergeMetadata(metadata);
+                    m_metadataAttempted = true;
+                }
+            }
+        } else if (current && retry > 0 && !m_metadataRetried && (status == "limited" || status == "quota")) {
+            m_metadataRetried = true;
+            m_metadataAttempted = false;
+        }
+        if (expected == m_selectedUri) {
+            if (status == "ok" && metadata.value("uri").toString() == expected)
+                m_selection = metadata.toVariantMap();
+            m_lookupSelection = false;
             emit selectionChanged();
         }
+        m_webMetadataGeneration = 0;
+        emit playbackChanged();
     } else if (operation == "connect") {
         if (status == "authorized") {
+            m_metadataAttempted = false;
+            m_metadataRetried = false;
             m_checkedTrack.clear();
-            m_pages.clear();
-            navigate(m_offset);
-        } else if (!m_loadPending) {
-            m_libraryStatus = status;
+            m_roots.clear();
+            m_collections.clear();
+            reloadLibrary();
+        } else if (!m_context.pending) {
+            m_context.status = status;
         }
     } else if (status == "ok") {
         if (arguments.value(0) == trackId(m_playback))
             m_favorite = result.value("saved").toBool() ? 1 : 0;
         if (operation == "save" || operation == "remove") {
-            m_pages.clear();
-            if (m_category == "tracks" && m_collectionUri.isEmpty())
-                navigate(m_offset);
+            m_roots.remove("tracks");
+            if (libraryContext() == "tracks")
+                reloadLibrary();
         }
-    } else if (operation == "save" || operation == "remove") {
-        if (!m_loadPending)
-            m_libraryStatus = status;
     }
     emit libraryChanged();
     loadPending();

@@ -3,7 +3,7 @@ pragma ComponentBehavior: Bound
 import QtQuick
 import QtQuick.Controls as Controls
 import QtQuick.Layouts
-import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 
 ColumnLayout {
@@ -12,34 +12,117 @@ ColumnLayout {
   required property var spotify
   required property var translations
   required property color foreground
+  required property bool browsing
   property string category: "tracks"
-  property int offset: 0
-  property bool pending: true
-  readonly property bool loading: pending || (spotify.busy && spotify.action === "library")
-  readonly property var page: spotify.library.kind === category && spotify.library.offset === offset
-    ? spotify.library : {}
-  readonly property var items: page.items ?? []
-  readonly property int pageSize: 20
+  property string displayedCategory: ""
+  property var contexts: ({})
+  property var request: null
+  property bool restoring: false
+  readonly property var context: contexts[category] ?? {}
+  readonly property bool loading: context.status === "loading" || context.status === "loadingMore"
+  readonly property bool failed: !!context.status && !loading && context.status !== "ok"
 
-  spacing: Style.space(6)
+  spacing: Commons.Style.space(6)
 
-  function load(kind, position) {
+  function update(kind, changes) {
+    const state = Object.assign({ items: [], next: 0, scroll: 0, status: "loading", pending: true },
+      root.contexts[kind], changes)
+    const contexts = Object.assign({}, root.contexts)
+    contexts[kind] = state
+    root.contexts = contexts
+  }
+
+  function show(kind) {
+    root.restoring = true
+    if (!root.contexts[kind])
+      root.update(kind, {})
     root.category = kind
-    root.offset = position
-    root.pending = true
+    root.displayedCategory = kind
+    rows.clear()
+    for (const item of root.context.items)
+      rows.append({ title: item.title, subtitle: item.subtitle, uri: item.uri })
+    Qt.callLater(root.restoreScroll)
+  }
+
+  function restoreScroll() {
+    entries.forceLayout()
+    entries.contentY = entries.originY + Math.min(root.context.scroll ?? 0,
+      Math.max(0, entries.contentHeight - entries.height))
+    root.restoring = false
+    root.maybeLoadMore()
+  }
+
+  function maybeLoadMore() {
+    if (root.browsing && !root.restoring && root.context.status === "ok" && root.context.next >= 0
+        && entries.contentHeight - (entries.contentY - entries.originY) - entries.height < Commons.Style.space(100))
+      root.update(root.category, { status: "loadingMore", pending: true })
+  }
+
+  function applyPage(page) {
+    if (!root.request || page.kind !== root.request.kind || page.offset !== root.request.offset)
+      return
+    const kind = root.request.kind
+    root.request = null
+    const state = root.contexts[kind]
+    if (!state)
+      return
+    if (page.status !== "ok") {
+      root.update(kind, { status: page.status })
+      return
+    }
+    for (const item of page.items ?? []) {
+      state.items.push(item)
+      if (kind === root.displayedCategory)
+        rows.append({ title: item.title, subtitle: item.subtitle, uri: item.uri })
+    }
+    root.update(kind, { status: "ok", next: Number.isInteger(page.next) && page.next > page.offset ? page.next : -1 })
+    Qt.callLater(root.maybeLoadMore)
+  }
+
+  onBrowsingChanged: {
+    if (browsing) {
+      if (!displayedCategory)
+        show(category)
+      else
+        Qt.callLater(root.maybeLoadMore)
+    }
+  }
+  Component.onCompleted: if (root.browsing && !root.displayedCategory) root.show(root.category)
+
+  Connections {
+    target: root.spotify
+    function onLibraryChanged() {
+      root.applyPage(root.spotify.library)
+    }
+    function onSampleChanged() {
+      if (["authorized", "disconnected", "setup_required", "reauthorize"].includes(root.spotify.sample.status)) {
+        root.contexts = {}
+        root.request = null
+        root.displayedCategory = ""
+        rows.clear()
+        if (root.browsing)
+          root.show(root.category)
+      }
+    }
   }
 
   Timer {
     interval: 1
-    running: root.pending && root.spotify.available && !root.spotify.busy
+    running: root.browsing && !!root.context.pending && root.request === null
+      && root.spotify.available && !root.spotify.busy
     onTriggered: {
-      if (root.spotify.run("library", [root.category, String(root.offset)]))
-        root.pending = false
+      const offset = root.context.next
+      if (root.spotify.run("library", [root.category, String(offset)])) {
+        root.request = { kind: root.category, offset: offset }
+        root.update(root.category, { pending: false })
+      }
     }
   }
 
+  ListModel { id: rows }
+
   RowLayout {
-    spacing: Style.space(4)
+    spacing: Commons.Style.space(4)
     Layout.fillWidth: true
 
     Repeater {
@@ -51,79 +134,85 @@ ColumnLayout {
         selected: root.category === modelData
         focusable: true
         Layout.fillWidth: true
-        onClicked: if (root.category !== modelData) root.load(modelData, 0)
+        onClicked: if (root.category !== modelData) root.show(modelData)
       }
     }
   }
 
   Text {
-    visible: root.loading || root.items.length === 0
+    visible: entries.count === 0
     textFormat: Text.PlainText
-    font.family: Style.font.family
-    font.pixelSize: Style.font.body
+    font.family: Commons.Style.font.family
+    font.pixelSize: Commons.Style.font.body
     color: root.foreground
     wrapMode: Text.WordWrap
     text: root.loading ? root.translations.t("libraryLoading")
-      : root.translations.t(root.page.status && root.page.status !== "ok" ? root.page.status : "libraryEmpty")
+      : root.translations.t(root.failed ? root.context.status : "libraryEmpty")
     Layout.fillWidth: true
   }
 
   ListView {
     id: entries
-    visible: !root.loading && root.items.length > 0
+    visible: count > 0
     clip: true
     reuseItems: true
-    model: root.items
+    model: rows
     Layout.fillWidth: true
-    Layout.preferredHeight: Math.min(count, 7) * Style.space(34)
+    Layout.preferredHeight: Math.min(count, 7) * Commons.Style.space(34)
 
     Controls.ScrollBar.vertical: Controls.ScrollBar {}
 
+    onContentYChanged: {
+      if (root.browsing && !root.restoring && root.contexts[root.displayedCategory])
+        root.contexts[root.displayedCategory].scroll = Math.max(0, contentY - originY)
+      Qt.callLater(root.maybeLoadMore)
+    }
+    onContentHeightChanged: Qt.callLater(root.maybeLoadMore)
+    onHeightChanged: Qt.callLater(root.maybeLoadMore)
+
     delegate: Button {
-      required property var modelData
-      text: modelData.subtitle ? modelData.title + " · " + modelData.subtitle : modelData.title
+      id: entry
+
+      required property string title
+      required property string subtitle
+      required property string uri
+      text: entry.subtitle ? entry.title + " · " + entry.subtitle : entry.title
       foreground: root.foreground
       leftAlign: true
       focusable: true
-      width: entries.width - Style.space(8)
-      height: Style.space(34)
-      Accessible.name: text
+      width: entries.width - Commons.Style.space(8)
+      height: Commons.Style.space(34)
       enabled: !root.spotify.openingDesktop
-      onClicked: root.spotify.openDesktop(modelData.uri)
+      Accessible.name: entry.text
+      onClicked: root.spotify.openDesktop(
+        root.category === "tracks" ? "--play-track"
+          : root.category === "albums" ? "--open-album" : "--open-playlist", entry.uri)
     }
   }
 
   RowLayout {
-    visible: !root.loading && (root.offset > 0 || Number.isInteger(root.page.next)
-      || (!!root.page.status && root.page.status !== "ok"))
-    spacing: Style.space(5)
+    visible: root.failed || (root.loading && entries.count > 0)
+    spacing: Commons.Style.space(5)
     Layout.fillWidth: true
 
-    Button {
-      visible: root.offset > 0
-      text: root.translations.t("previousPage")
-      foreground: root.foreground
-      focusable: true
-      enabled: root.spotify.available
-      onClicked: root.load(root.category, Math.max(0, root.offset - root.pageSize))
+    Text {
+      visible: entries.count > 0
+      text: root.translations.t(root.loading ? "libraryLoadingMore" : "libraryMoreError")
+      textFormat: Text.PlainText
+      color: root.foreground
+      font.family: Commons.Style.font.family
+      font.pixelSize: Commons.Style.font.body
+      elide: Text.ElideRight
+      Layout.fillWidth: true
     }
 
     Button {
-      visible: Number.isInteger(root.page.next)
-      text: root.translations.t("nextPage")
-      foreground: root.foreground
-      focusable: true
-      enabled: root.spotify.available
-      onClicked: root.load(root.category, root.page.next)
-    }
-
-    Button {
-      visible: !!root.page.status && root.page.status !== "ok"
+      visible: root.failed
       text: root.translations.t("retry")
       foreground: root.foreground
       focusable: true
       enabled: root.spotify.available
-      onClicked: root.load(root.category, root.offset)
+      onClicked: root.update(root.category, { status: entries.count > 0 ? "loadingMore" : "loading", pending: true })
     }
   }
 }

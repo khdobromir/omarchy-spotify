@@ -13,19 +13,22 @@ Scope {
   property var args: []
   property string notice: ""
   property var queued: null
+  property string desktopAction: "--activate"
   property string desktopUri: ""
   property string desktopNotice: ""
   readonly property bool openingDesktop: desktop.running
   property bool coolingDown: false
+  property bool statusDue: false
   readonly property bool busy: worker.running
-  readonly property bool available: !coolingDown && queued === null && (!busy || action === "status")
+  readonly property bool available: !coolingDown && !statusDue && queued === null && (!busy || action === "status")
   readonly property string helper: Qt.resolvedUrl("spotify.py").toString().slice("file://".length)
 
-  function openDesktop(uri) {
+  function openDesktop(action, uri) {
     if (desktop.running)
       return
     root.desktopNotice = ""
-    root.desktopUri = uri
+    root.desktopAction = action
+    root.desktopUri = uri ?? ""
     desktop.running = true
   }
 
@@ -38,7 +41,10 @@ Scope {
       root.queued = [command, parameters]
       return true
     }
-    poll.stop()
+    if (command !== "library")
+      poll.stop()
+    if (command === "status")
+      root.statusDue = false
     root.action = command
     root.args = parameters ?? []
     if (!["status", "favorite", "library"].includes(command))
@@ -76,9 +82,10 @@ Scope {
       root.library = {}
       if (sessionEnded)
         root.coolingDown = false
-    } else if (command === "library") {
+    }
+    if (command === "library") {
       root.library = Object.assign(result, { kind: root.args[0], offset: Number(root.args[1]) })
-    } else if (["favorite", "save", "remove"].includes(command)) {
+    } else if (["favorite", "save", "remove"].includes(command) && !sessionEnded) {
       if (status === "ok" || command === "favorite")
         root.favorite = Object.assign(result, { id: root.args[0] })
     }
@@ -100,13 +107,13 @@ Scope {
     let delay = 0
     if (result.retry)
       delay = result.retry * 1000
-    else if (root.queued !== null || status === "authorized")
+    else if (root.queued !== null || status === "authorized" || root.statusDue)
       delay = 1
     else if (playbackChanged)
       delay = 600
     else if (root.sample.status === "track" || root.sample.status === "idle")
       delay = root.sample.playing ? 10000 : 25000
-    if (delay > 0) {
+    if (delay > 0 && (!poll.running || result.retry)) {
       poll.interval = Math.min(delay, 2147483647)
       poll.start()
     }
@@ -117,6 +124,10 @@ Scope {
   Timer {
     id: poll
     onTriggered: {
+      if (root.busy) {
+        root.statusDue = true
+        return
+      }
       root.coolingDown = false
       const pending = root.queued
       root.queued = null
@@ -129,7 +140,7 @@ Scope {
 
   Process {
     id: desktop
-    command: ["python3", "-B", decodeURIComponent(root.helper), "desktop"]
+    command: ["python3", "-B", decodeURIComponent(root.helper), "desktop", root.desktopAction]
       .concat(root.desktopUri ? [root.desktopUri] : [])
     onExited: {
       let status = "desktop_failed"
