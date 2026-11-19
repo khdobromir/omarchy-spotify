@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "khdobromir.spotify",
+  "name": "Spotify Now Playing",
+  "version": "1.0.0",
+  "author": "khdobromir",
+  "description": "Shows Spotify playback across your devices",
+  "kinds": ["service", "bar-widget"],
+  "entryPoints": { "service": "Service.qml", "barWidget": "BarWidget.qml" },
+  "barWidget": {
+    "displayName": "Spotify Now Playing",
+    "description": "Current track and playback progress",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "left"
+  }
+}
