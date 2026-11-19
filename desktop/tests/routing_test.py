@@ -120,8 +120,8 @@ class RoutingTest(unittest.TestCase):
         self.assertEqual(self.log("played"), [])
 
     def test_locked_instance_without_socket_does_not_start_another_player(self):
-        self.start()
-        self.await_log("web", ["library", "tracks", "0"])
+        self.start(TRACK)
+        self.await_log("played", ["play", TRACK])
         daemon = (self.root / "daemon").read_text()
         (self.root / "omarchy-spotify.sock").unlink()
         self.assertNotEqual(self.launch("--activate").returncode, 0)

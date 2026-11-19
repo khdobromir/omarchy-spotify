@@ -103,7 +103,7 @@ ApplicationWindow {
             if (albums.count === 0)
                 return
             albums.forceLayout()
-            albums.contentY = albums.originY + Math.min(Math.floor(backend.libraryScroll() / columnCount(albums)) * albums.cellHeight,
+            albums.contentY = albums.originY + Math.min(backend.libraryScroll() / columnCount(albums) * albums.cellHeight,
                 Math.max(0, albums.contentHeight - albums.height))
         } else {
             if (rows.count === 0)

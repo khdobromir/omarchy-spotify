@@ -133,6 +133,37 @@ private slots:
         QCOMPARE(backend.playback().value("uri").toString(), trackA);
         QCOMPARE(readFile(log).count(QByteArray("\"track\", \"") + QByteArray(22, 'a')), 1);
     }
+
+    void sendsTransportCommandsAndRejectsSeekForPreviousTrack() {
+        QTemporaryDir directory;
+        QVERIFY(configure(directory));
+        Backend backend;
+        const QString events = directory.filePath("events");
+        const QString commands = directory.filePath("played");
+        QTRY_VERIFY(backend.playback().value("ready").toBool());
+        QVERIFY(writeFile(events, "0 {\"type\":\"playback_state\",\"status\":\"playing\",\"item\":{\"uri\":\""
+            + trackA.toUtf8() + "\"}}\n", true));
+        QTRY_COMPARE(backend.playback().value("title").toString(), "API a");
+        backend.seek(5000, trackC);
+        QVERIFY(!QFile::exists(commands));
+        backend.seek(5000, trackA);
+        QTRY_VERIFY(readFile(commands).contains("[\"seek\", \"5000\"]"));
+        QTRY_VERIFY(!backend.commandBusy());
+        backend.togglePlayback();
+        QTRY_VERIFY(readFile(commands).contains("[\"pause\"]"));
+        QTRY_VERIFY(!backend.commandBusy());
+        QVERIFY(writeFile(events, "0 {\"type\":\"playback_changed\",\"status\":\"paused\"}\n", true));
+        QTRY_VERIFY(!backend.playback().value("playing").toBool());
+        QCOMPARE(backend.playback().value("title").toString(), "API a");
+        backend.togglePlayback();
+        QTRY_VERIFY(readFile(commands).contains("[\"play\"]"));
+        QTRY_VERIFY(!backend.commandBusy());
+        backend.skip(true);
+        QTRY_VERIFY(readFile(commands).contains("[\"next\"]"));
+        QTRY_VERIFY(!backend.commandBusy());
+        backend.skip(false);
+        QTRY_VERIFY(readFile(commands).contains("[\"prev\"]"));
+    }
 };
 
 QTEST_GUILESS_MAIN(BackendTest)

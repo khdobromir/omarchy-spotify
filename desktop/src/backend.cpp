@@ -310,6 +310,8 @@ void Backend::openUri(const QString &uri) {
     if (!Playback::playableUri(uri))
         return;
     if (uri.startsWith("spotify:album:") || uri.startsWith("spotify:playlist:")) {
+        if (m_selectionStatus == "inspecting")
+            dismissSelection();
         openCollection(uri);
     } else {
         if (m_category != "tracks" || !m_collectionUri.isEmpty())
