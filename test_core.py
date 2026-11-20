@@ -274,3 +274,51 @@ class CoreTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(core.snapshot()["title"], "New")
             await core.refresh()
             self.assertEqual(core.snapshot()["title"], "New")
+
+    async def test_pause_is_published_while_command_waits_for_network(self):
+        core = Core()
+        core.sample = {**spotify.remote_sample(PHONE), "sync": "ok", "duration": 90000, "progress": 20000}
+        core.sampled = 100.0
+        snapshots = []
+        before_command = core.sample
+
+        with patch("spotify_core.time") as timing, patch.object(
+            core, "publish", side_effect=lambda: snapshots.append(core.snapshot())
+        ):
+            async def delayed_spotify(method, args=()):
+                timing.monotonic.return_value += 1
+                self.assertEqual(core.snapshot()["progress"], 20500)
+                self.assertTrue(core.snapshot()["positionFrozen"])
+                return before_command if method == "sample" else {"status": "ok"}
+
+            timing.monotonic.return_value = 100.5
+            with patch.object(core, "call", side_effect=delayed_spotify) as call:
+                task = None
+                try:
+                    async with core.lock:
+                        task = asyncio.create_task(core.execute("playback.pause", {"deviceId": "phone"}))
+                        await asyncio.sleep(0)
+                        call.assert_not_called()
+                        self.assertEqual(snapshots[-1]["progress"], 20500)
+                        self.assertTrue(snapshots[-1]["positionFrozen"])
+                    self.assertEqual(await task, {"accepted": True})
+                    self.assertEqual(core.snapshot()["progress"], 20500)
+                    self.assertTrue(core.snapshot()["positionFrozen"])
+                finally:
+                    if task and not task.done():
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+
+    async def test_denied_skip_clears_the_transition(self):
+        core = Core()
+        core.sample = {**spotify.remote_sample(PHONE), "sync": "ok"}
+        core.sampled = time.monotonic()
+        samples = [core.sample, {"status": "action_forbidden"}]
+        with patch.object(core, "publish") as publish, patch.object(core, "call", side_effect=samples):
+            snapshots = []
+            publish.side_effect = lambda: snapshots.append(core.snapshot())
+            with self.assertRaisesRegex(ValueError, "action_forbidden"):
+                await core.execute("playback.next", {"deviceId": "phone"})
+            self.assertTrue(snapshots[0]["transitioning"])
+            self.assertFalse(snapshots[-1]["transitioning"])
+            self.assertEqual(snapshots[-1]["uri"], core.sample["uri"])

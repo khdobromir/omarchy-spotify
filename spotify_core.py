@@ -82,6 +82,7 @@ class Core:
         self.poller = None
         self.wake = asyncio.Event()
         self.pending = None
+        self.preview = None
         self.command_unconfirmed = False
         self.end_probes = 0
         self.preferred_path = spotify.CLIENT_ID_FILE.parent / "spotify-preferred-device.json"
@@ -133,14 +134,19 @@ class Core:
     def snapshot(self):
         snapshot = {**self.sample, "revision": self.revision, "accountRevision": self.account_revision,
                     "sampleAgeMs": int((time.monotonic() - self.sampled) * 1000) if self.sampled else 0}
-        action = self.pending.action if self.pending else None
-        frozen = self.pending.frozen_position if self.pending else None
+        preview = self.preview
+        if (preview and (self.sample.get("sync") != "ok"
+                         or preview.before.get("deviceId") != self.sample.get("deviceId"))):
+            preview = None
+        presentation = preview or self.pending
+        action = presentation.action if presentation else None
+        frozen = presentation.frozen_position if presentation else None
         if frozen is not None:
             snapshot.update(progress=frozen, sampleAgeMs=0)
         at_end = not action and self.end_probes > 0 and self.sample.get("sync") == "ok"
         return {**snapshot, "pending": action, "positionFrozen": frozen is not None,
                 "transitioning": action in TRACK_COMMANDS or at_end,
-                "commandSync": "unconfirmed" if self.command_unconfirmed else None,
+                "commandSync": "unconfirmed" if self.command_unconfirmed and not preview else None,
                 "sync": self.sample.get("sync", "loading")}
 
     def end_delay(self, now):
@@ -238,7 +244,44 @@ class Core:
         for writer in tuple(self.connections):
             writer.transport.abort()
 
-    async def player(self, action, params):
+    def estimated_position(self, now):
+        position = self.sample.get("progress")
+        if position is not None and self.sample.get("playing"):
+            position += int(max(0, now - self.sampled) * 1000)
+            position = min(position, self.sample.get("duration") or position)
+        return position
+
+    def preview_command(self, method, params):
+        action = method.removeprefix("playback.")
+        target = self.sample.get("deviceId")
+        if (self.preview or not method.startswith("playback.") or action not in TRACK_COMMANDS | {"pause"}
+                or self.sample.get("sync") != "ok" or not target or params.get("deviceId", target) != target):
+            return None
+        now = time.monotonic()
+        position = self.estimated_position(now) if action == "pause" else None
+        self.preview = PendingPlayback(action, self.sample, now, frozen_position=position)
+        self.publish()
+        return self.preview
+
+    async def execute(self, method, params):
+        preview = self.preview_command(method, params)
+        try:
+            try:
+                await asyncio.wait_for(self.lock.acquire(), 4)
+            except TimeoutError:
+                raise ValueError("request_timeout") from None
+            try:
+                if preview is None:
+                    preview = self.preview_command(method, params)
+                return await self.dispatch(method, params, preview=preview)
+            finally:
+                self.lock.release()
+        finally:
+            if preview is not None and self.preview is preview:
+                self.preview = None
+                self.publish()
+
+    async def player(self, action, params, preview=None):
         if action not in TRANSPORT and action != "transfer":
             raise ValueError("unsupported_method")
         if action == "transfer":
@@ -312,26 +355,25 @@ class Core:
             self.wake.set()
             raise ValueError(result["status"])
         now = time.monotonic()
-        position = self.sample.get("progress")
-        if action == "pause" and position is not None and self.sample.get("playing"):
-            position += int(max(0, now - self.sampled) * 1000)
-            position = min(position, self.sample.get("duration") or position)
+        position = preview.frozen_position if preview else self.estimated_position(now)
         track_uri = params.get("uri") if action == "play" else None
         if track_uri and not track_uri.startswith(("spotify:track:", "spotify:episode:")):
             track_uri = None
         self.pending = PendingPlayback(action, self.sample, now,
                                        frozen_position=position if action == "pause" else None,
                                        track_uri=track_uri)
+        if self.preview is preview:
+            self.preview = None
         self.command_unconfirmed = False
         self.publish()
         self.wake.set()
         return {"accepted": True}
 
-    async def dispatch(self, method, params):
+    async def dispatch(self, method, params, *, preview=None):
         if method == "snapshot":
             return self.snapshot()
         if method.startswith("playback."):
-            return await self.player(method.removeprefix("playback."), params)
+            return await self.player(method.removeprefix("playback."), params, preview)
         if method not in READ_METHODS | ACCOUNT_METHODS | {"preferDevice", "refresh"}:
             raise ValueError("unsupported_method")
         if method == "refresh":
@@ -433,14 +475,7 @@ class Core:
                         if first:
                             self.wake.set()
                     else:
-                        try:
-                            await asyncio.wait_for(self.lock.acquire(), 4)
-                        except TimeoutError:
-                            raise ValueError("request_timeout") from None
-                        try:
-                            result = await self.dispatch(method, params)
-                        finally:
-                            self.lock.release()
+                        result = await self.execute(method, params)
                     self.send(writer, {"id": identity, "ok": True, "result": result})
                 except (ValueError, RecursionError) as error:
                     code = str(error)
