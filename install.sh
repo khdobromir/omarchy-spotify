@@ -80,8 +80,8 @@ if [[ ${2:-} == --widget || ( -L $plugin && $(readlink -- "$plugin") == "$packag
         printf 'Unexpected widget path %s\n' "$plugin" >&2
         exit 1
     fi
-    omarchy-shell shell rescanPlugins
-    omarchy-shell shell reloadPlugins
+    # The running shell can keep compiled QML for the previous plugin at this URL.
+    omarchy restart shell
     if [[ ${2:-} == --widget ]]; then
         omarchy plugin enable khdobromir.spotify
     fi

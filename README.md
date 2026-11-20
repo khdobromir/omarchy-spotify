@@ -22,7 +22,7 @@ ctest --test-dir desktop/build --output-on-failure
 ./install.sh desktop/build --widget
 ```
 
-Omit `--widget` for desktop-only installation. The installer stages the widget with the application and keeps a backup in the application state directory when migrating a previous plugin checkout. Run the same command after rebuilding to update the components together. Launch **Omarchy Spotify** from the application menu. The desktop works without Omarchy or Quickshell.
+Omit `--widget` for desktop-only installation. The installer stages the widget with the application and keeps a backup in the application state directory when migrating a previous plugin checkout. Run the same command after rebuilding to update the components together. Widget installation and updates restart the Omarchy shell so it loads the new QML. Launch **Omarchy Spotify** from the application menu. The desktop works without Omarchy or Quickshell.
 
 `./install.sh --uninstall` removes the installed files registered by the installer. Authorization, application preferences, and the previous widget backup are retained. To roll back, reinstall the previous compatible desktop and widget together, and restore the previous widget directory from its backup if needed.
 

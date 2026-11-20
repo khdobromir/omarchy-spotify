@@ -18,11 +18,23 @@ with TemporaryDirectory(prefix="spotify-widget-") as directory:
 import QtQuick
 import Quickshell
 ShellRoot {
-    Service {
-        id: spotify
-        onSampleChanged: {
-            if (sample.device === "Phone" && available)
-                run("pause", ["phone"])
+    id: root
+    property var spotify
+    Component.onCompleted: {
+        const service = Qt.createComponent("Service.qml", Component.PreferSynchronous);
+        if (service.status !== Component.Ready) {
+            console.error(service.errorString());
+            Qt.quit();
+            return;
+        }
+        root.spotify = service.createObject(null);
+    }
+    Connections {
+        target: root.spotify ?? null
+        function onSampleChanged() {
+            const spotify = root.spotify;
+            if (spotify.sample.device === "Phone" && spotify.available)
+                spotify.run("pause", ["phone"]);
         }
     }
     Timer {
