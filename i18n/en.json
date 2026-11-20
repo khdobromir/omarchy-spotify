@@ -1,4 +1,6 @@
 {
+  "updatingPlayback": "Updating playback…",
+  "commandUnconfirmed": "Spotify has not confirmed the command.",
   "loading": "Checking Spotify…",
   "setup_required": "Save your Spotify Client ID in ~/.config/omarchy/spotify-client-id, then click Connect Spotify.",
   "disconnected": "Connect Spotify to show what’s playing on your devices.",

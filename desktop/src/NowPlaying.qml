@@ -26,7 +26,7 @@ FocusScope {
     Image {
         id: backdrop
         anchors.fill: parent
-        source: stage.track.art || ""
+        source: stage.backend.playbackTransition ? "" : (stage.track.art || "")
         sourceSize.width: 48
         sourceSize.height: 48
         fillMode: Image.PreserveAspectCrop
@@ -71,7 +71,7 @@ FocusScope {
             Layout.preferredWidth: stage.artSide
             Layout.preferredHeight: stage.artSide
             radius: 2
-            source: stage.track.artHigh || stage.track.art || ""
+            source: stage.backend.playbackTransition ? "" : (stage.track.artHigh || stage.track.art || "")
             decodeSize: Math.min(1200, Math.max(640, Math.ceil(stage.artSide * Screen.devicePixelRatio / 128) * 128))
             surround: stage.baseColor
             ink: stage.ink
@@ -99,7 +99,7 @@ FocusScope {
             Label {
                 Layout.fillWidth: true
                 horizontalAlignment: stage.wide ? Text.AlignLeft : Text.AlignHCenter
-                text: stage.track.artist || ""
+                text: stage.backend.playbackTransition ? "" : (stage.track.artist || "")
                 visible: text !== ""
                 textFormat: Text.PlainText
                 color: Qt.alpha(stage.ink, 0.76)

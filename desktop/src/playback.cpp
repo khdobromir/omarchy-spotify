@@ -209,7 +209,8 @@ void Playback::applyRemote(const QJsonObject &sample, qint64 now) {
     artHigh = QUrl(sample.value("artHigh").toString());
     duration = (std::max)(0, sample.value("duration").toInt());
     m_sampledAt = now;
-    m_speed = playing.toBool() && sample.value("progress").isDouble() ? 1 : 0;
+    m_speed = playing.toBool() && sample.value("sync") == "ok" && !sample.value("positionFrozen").toBool()
+        && sample.value("progress").isDouble() ? 1 : 0;
     const qint64 offset = m_speed > 0 ? std::clamp(sample.value("sampleAgeMs").toInteger(), qint64{0}, qint64{duration}) : 0;
     m_position = int(std::clamp(sample.value("progress").toInteger() + offset, qint64{0}, qint64{duration}));
 }

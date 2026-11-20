@@ -19,6 +19,8 @@ ApplicationWindow {
     readonly property bool keyEntry: ["key_required", "key_write", "player_failed"].includes(backend.playerStatus)
     property bool nowPlayingExpanded: false
     readonly property string trackTitle: {
+        if (backend.playbackTransition)
+            return qsTr("Updating playback…")
         if (track.title)
             return track.title
         if (!track.ready)
@@ -707,11 +709,11 @@ ApplicationWindow {
                     spacing: 9
 
                     Artwork {
-                        Layout.preferredWidth: 46
-                        Layout.preferredHeight: 46
-                        source: window.track.art || ""
+                        source: window.backend.playbackTransition ? "" : (window.track.art || "")
                         ink: window.theme.foreground
                         surround: window.surface
+                        Layout.preferredWidth: 46
+                        Layout.preferredHeight: 46
                     }
                     ColumnLayout {
                         Layout.fillWidth: true
@@ -725,9 +727,9 @@ ApplicationWindow {
                             font.weight: Font.DemiBold
                         }
                         PageLabel {
-                            Layout.fillWidth: true
-                            text: window.track.artist || ""
+                            text: window.backend.playbackTransition ? "" : (window.track.artist || "")
                             visible: text !== ""
+                            Layout.fillWidth: true
                         }
                         PageLabel {
                             text: window.track.device ? qsTr("Playing on %1").arg(window.track.device) : ""

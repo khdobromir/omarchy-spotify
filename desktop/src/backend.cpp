@@ -394,6 +394,7 @@ QVariantMap Backend::playback() const {
             {"device", m_local ? (m_playback.loggedIn ? QString("Omarchy Spotify") : QString{})
                                : m_sample.value("device").toString()},
             {"pending", m_local ? QString{} : m_sample.value("pending").toString()},
+            {"commandUnconfirmed", !m_local && m_sample.value("commandSync") == "unconfirmed"},
             {"shuffle", m_sample.value("shuffle").toVariant()},
             {"repeat", m_sample.value("repeat").toString()},
             {"volume", m_sample.value("capabilities").toObject().value("volume").toVariant()},
@@ -404,6 +405,14 @@ QVariantMap Backend::playback() const {
 
 int Backend::position() const {
     return m_playback.position(m_local ? QDateTime::currentMSecsSinceEpoch() : m_clock.elapsed());
+}
+
+bool Backend::playbackTransition() const {
+    if (m_local)
+        return false;
+    return m_sample.value("transitioning").toBool()
+        || (m_sample.value("sync") == "ok" && !m_sample.value("positionFrozen").toBool()
+            && m_playback.status == "playing" && m_playback.duration > 0 && position() >= m_playback.duration);
 }
 
 void Backend::setPlayerStatus(const QString &status) {

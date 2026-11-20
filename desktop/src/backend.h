@@ -40,6 +40,7 @@ class Backend : public QObject {
     Q_PROPERTY(QVariantList queue READ queue NOTIFY playerChanged)
     Q_PROPERTY(QVariantList devices READ devices NOTIFY playerChanged)
     Q_PROPERTY(bool localMode READ localMode NOTIFY playerChanged)
+    Q_PROPERTY(bool playbackTransition READ playbackTransition NOTIFY positionChanged FINAL)
     Q_PROPERTY(int position READ position NOTIFY positionChanged)
     Q_PROPERTY(QString playerStatus READ playerStatus NOTIFY playerChanged)
     Q_PROPERTY(QAbstractItemModel *entries READ entries CONSTANT)
@@ -64,6 +65,7 @@ public:
 
     QVariantMap playback() const;
     int position() const;
+    bool playbackTransition() const;
     QString playerStatus() const { return m_playerStatus; }
     QAbstractItemModel *entries() { return &m_entries; }
     QString libraryStatus() const { return m_context.status; }

@@ -147,6 +147,7 @@ def remote_sample(raw):
     actions = record(data.get("actions"))
     flags = record(actions.get("disallows")) or actions
     playing = data.get("is_playing")
+    timestamp = data.get("timestamp")
     item_type = kind or data.get("currently_playing_type")
     shuffle = data.get("shuffle_state")
     repeat = data.get("repeat_state")
@@ -155,6 +156,7 @@ def remote_sample(raw):
     return {"status": "private" if private else "track" if track else "idle" if raw is None else "unknown",
             "availability": "active" if device["active"] else "idle" if raw is None else "unknown",
             "itemType": label(item_type) or None,
+            "timestamp": timestamp if type(timestamp) is int and timestamp > 0 else None,
             "uri": track["uri"] if track else None,
             "trackId": item_id(item.get("id")) if kind == "track" else "",
             "title": track["title"] if track else "", "artist": track["subtitle"] if track else "",

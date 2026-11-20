@@ -15,6 +15,7 @@ ColumnLayout {
     property bool expanded: false
     readonly property var track: backend.playback
     readonly property bool ready: track.ready && !backend.commandBusy
+    readonly property bool transitioning: backend.playbackTransition
 
     spacing: expanded ? 12 : 0
 
@@ -61,7 +62,7 @@ ColumnLayout {
         spacing: 7
 
         Label {
-            text: transport.timestamp(seek.pressed ? seek.value : transport.backend.position)
+            text: transport.transitioning ? "–:––" : transport.timestamp(seek.pressed ? seek.value : transport.backend.position)
             font.pixelSize: 11
             color: Qt.alpha(transport.foreground, 0.72)
         }
@@ -75,7 +76,8 @@ ColumnLayout {
             leftPadding: 0
             rightPadding: 0
             to: Math.max(1, transport.track.duration)
-            enabled: transport.track.ready && !(transport.track.disallows ?? []).includes("seeking") && transport.track.duration > 0 && (!transport.backend.commandBusy || pressed)
+            visible: !transport.transitioning
+            enabled: visible && transport.track.ready && !(transport.track.disallows ?? []).includes("seeking") && transport.track.duration > 0 && (!transport.backend.commandBusy || pressed)
             Accessible.name: qsTr("Playback position")
             Binding on value {
                 when: !seek.pressed
@@ -122,10 +124,26 @@ ColumnLayout {
             }
         }
 
+        Item {
+            visible: transport.transitioning
+            Layout.fillWidth: true
+            Layout.preferredHeight: 21
+        }
+
         Label {
-            text: transport.track.duration > 0 ? transport.timestamp(transport.track.duration) : "–:––"
+            text: !transport.transitioning && transport.track.duration > 0 ? transport.timestamp(transport.track.duration) : "–:––"
             font.pixelSize: 11
             color: Qt.alpha(transport.foreground, 0.72)
         }
+    }
+
+    Label {
+        text: qsTr("Spotify has not confirmed the command.")
+        horizontalAlignment: Text.AlignHCenter
+        wrapMode: Text.WordWrap
+        color: Qt.alpha(transport.foreground, 0.72)
+        font.pixelSize: 11
+        visible: transport.track.commandUnconfirmed === true
+        Layout.fillWidth: true
     }
 }

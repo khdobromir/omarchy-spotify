@@ -51,6 +51,11 @@ class CoreTest(unittest.IsolatedAsyncioTestCase):
                     await request(second, "subscribe")
                     result = await request(first, "playback.pause", {"deviceId": "phone"})
                     self.assertTrue(result["result"]["accepted"])
+                    while True:
+                        event = json.loads(await asyncio.wait_for(second[0].readline(), 3))
+                        if event.get("data", {}).get("pending") == "pause":
+                            self.assertTrue(event["data"]["positionFrozen"])
+                            break
                     self.assertTrue(any("/pause?device_id=phone" in url for url, _ in calls))
                     self.assertFalse(any(url == spotify.PLAYER_URL and opts.get("method") == "PUT"
                                          for url, opts in calls))
@@ -154,3 +159,118 @@ class CoreTest(unittest.IsolatedAsyncioTestCase):
                 async with server:
                     await core.close()
                 self.assertTrue(path.is_socket())
+
+    async def test_pause_freezes_both_snapshots_until_spotify_confirms(self):
+        core = Core()
+        playing = {**spotify.remote_sample(PHONE), "duration": 90000, "progress": 20000}
+        clock = 100.0
+        with patch("spotify_core.time") as timing, patch.object(
+            core, "call", side_effect=[playing, {"status": "ok"}, playing, {**playing, "playing": False}]
+        ):
+            timing.monotonic.side_effect = lambda: clock
+            await core.dispatch("playback.pause", {"deviceId": "phone"})
+            accepted = core.snapshot()
+            self.assertTrue(accepted["positionFrozen"])
+            self.assertEqual(accepted["pending"], "pause")
+            clock += 0.3
+            await core.refresh()
+            self.assertEqual(core.snapshot()["progress"], accepted["progress"])
+            self.assertTrue(core.snapshot()["positionFrozen"])
+            clock += 0.6
+            await core.refresh()
+            self.assertFalse(core.snapshot()["playing"])
+            self.assertFalse(core.snapshot()["positionFrozen"])
+            self.assertIsNone(core.snapshot()["pending"])
+
+    async def test_track_transition_waits_for_new_snapshot(self):
+        core = Core()
+        old = spotify.remote_sample(PHONE)
+        new = {**old, "uri": "spotify:track:" + "b" * 22, "title": "New", "art": "new-art"}
+        with patch.object(core, "call", side_effect=[old, {"status": "ok"}, old, new]):
+            await core.dispatch("playback.next", {"deviceId": "phone"})
+            self.assertTrue(core.snapshot()["transitioning"])
+            await core.refresh()
+            self.assertTrue(core.snapshot()["transitioning"])
+            await core.refresh()
+            result = core.snapshot()
+            self.assertFalse(result["transitioning"])
+            self.assertEqual((result["title"], result["art"]), ("New", "new-art"))
+
+    async def test_track_end_probe_is_bounded_and_rearms_on_repeat(self):
+        core = Core()
+        core.clients.update((object(), object()))
+        old = {**spotify.remote_sample(PHONE), "duration": 90000, "progress": 89000}
+        clock = 100.0
+        with patch("spotify_core.time") as timing, patch.object(
+            core, "call", side_effect=[old, old, old, {**old, "progress": 20}, {**old, "playing": False}]
+        ), patch.object(core, "send"):
+            timing.monotonic.side_effect = lambda: clock
+            await core.refresh()
+            self.assertAlmostEqual(core.poll_delay(), 1.2)
+            clock += 1.2
+            await core.refresh()
+            self.assertAlmostEqual(core.poll_delay(), 0.8)
+            clock += 0.8
+            await core.refresh()
+            self.assertAlmostEqual(core.poll_delay(), 4)
+            clock += 4
+            await core.refresh()
+            self.assertEqual(core.end_probes, 0)
+            self.assertAlmostEqual(core.poll_delay(), 4)
+            await core.refresh()
+            self.assertAlmostEqual(core.poll_delay(), 4)
+            core.cooldown = clock + 30
+            self.assertAlmostEqual(core.poll_delay(), 30)
+
+    async def test_unconfirmed_command_returns_to_last_reported_sample(self):
+        core = Core()
+        old = {**spotify.remote_sample(PHONE), "duration": 90000, "progress": 20000}
+        clock = 100.0
+        core.clients.add(object())
+        with patch("spotify_core.time") as timing, patch.object(
+            core, "call", side_effect=[old, {"status": "ok"}, old, old, old]
+        ), patch.object(core, "send"):
+            timing.monotonic.side_effect = lambda: clock
+            await core.dispatch("playback.next", {})
+            self.assertEqual(core.poll_delay(), 0)
+            await core.refresh()
+            self.assertAlmostEqual(core.poll_delay(), 0.6)
+            clock += 0.6
+            await core.refresh()
+            self.assertAlmostEqual(core.poll_delay(), 0.9)
+            clock += 0.9
+            await core.refresh()
+            result = core.snapshot()
+            self.assertEqual(result["commandSync"], "unconfirmed")
+            self.assertFalse(result["transitioning"])
+            self.assertEqual(result["uri"], old["uri"])
+            self.assertEqual(core.poll_delay(), 4)
+
+    async def test_external_pause_and_rate_limit_stop_interpolation(self):
+        core = Core()
+        playing = {**spotify.remote_sample(PHONE), "duration": 90000, "progress": 20000}
+        core.clients.add(object())
+        with patch.object(core, "call", side_effect=[
+            playing, {**playing, "playing": False, "progress": 20500}, {"status": "limited", "retry": 30}
+        ]), patch.object(core, "send"):
+            await core.refresh()
+            self.assertEqual(core.poll_delay(), 4)
+            await core.refresh()
+            self.assertFalse(core.snapshot()["playing"])
+            self.assertEqual(core.snapshot()["progress"], 20500)
+            self.assertEqual(core.poll_delay(), 4)
+            await core.refresh()
+            self.assertEqual(core.snapshot()["sync"], "limited")
+
+    async def test_older_spotify_sample_does_not_restore_previous_track(self):
+        core = Core()
+        old = {**PHONE, "timestamp": 1000}
+        new = {**PHONE, "timestamp": 2000, "item": {**PHONE["item"], "id": "b" * 22, "name": "New"}}
+        with patch.object(core, "call", side_effect=[
+            spotify.remote_sample(old), {"status": "ok"}, spotify.remote_sample(new), spotify.remote_sample(old)
+        ]):
+            await core.dispatch("playback.next", {})
+            await core.refresh()
+            self.assertEqual(core.snapshot()["title"], "New")
+            await core.refresh()
+            self.assertEqual(core.snapshot()["title"], "New")

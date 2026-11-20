@@ -8,7 +8,7 @@ BarWidget {
   readonly property var spotify: pluginBar?.shell?.serviceFor("khdobromir.spotify") ?? null
   readonly property var sample: spotify?.sample ?? { status: "loading" }
   readonly property string icon: "󰓇"
-  readonly property string trackLabel: sample.status !== "track" ? "" : (sample.artist ? sample.artist + " · " : "") + sample.title
+  readonly property string trackLabel: sample.status !== "track" || sample.transitioning === true ? "" : (sample.artist ? sample.artist + " · " : "") + sample.title
   property bool popupOpen: false
 
   moduleName: "khdobromir.spotify"

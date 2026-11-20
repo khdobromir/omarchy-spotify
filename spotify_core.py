@@ -1,6 +1,7 @@
 """Single Spotify session and Unix-socket server."""
 import asyncio
 from collections import OrderedDict
+from dataclasses import dataclass
 import fcntl
 import json
 import os
@@ -34,6 +35,37 @@ TRANSPORT = {
 }
 
 
+ACTIVE_POLL_INTERVAL = 4
+TRACK_COMMANDS = {"next", "previous", "play"}
+RECHECK_DELAYS = (0, 0.6, 1.5)
+
+
+def rewound(before, after):
+    start, end = before.get("progress"), after.get("progress")
+    return start is not None and end is not None and start - end > 250
+
+
+@dataclass
+class PendingPlayback:
+    action: str
+    before: dict
+    accepted_at: float
+    frozen_position: int | None = None
+    track_uri: str | None = None
+    checks: int = 0
+
+    def confirmed(self, sample):
+        if self.action in TRACK_COMMANDS | {"pause", "resume"} and sample.get("deviceId") != self.before.get("deviceId"):
+            return False
+        if self.action in TRACK_COMMANDS:
+            uri = sample.get("uri")
+            return bool(uri and (not self.track_uri or uri == self.track_uri)
+                        and (uri != self.before.get("uri") or rewound(self.before, sample)))
+        if self.action in ("pause", "resume"):
+            return sample.get("playing") is (self.action == "resume")
+        return True
+
+
 class Core:
     def __init__(self):
         self.sample = {"status": "loading"}
@@ -50,7 +82,8 @@ class Core:
         self.poller = None
         self.wake = asyncio.Event()
         self.pending = None
-        self.reconcile = 0
+        self.command_unconfirmed = False
+        self.end_probes = 0
         self.preferred_path = spotify.CLIENT_ID_FILE.parent / "spotify-preferred-device.json"
         self.preferred = self.load_preference()
 
@@ -89,7 +122,8 @@ class Core:
         if result.get("status") == "quota":
             self.quota = True
             self.pending = None
-            self.reconcile = 0
+            self.command_unconfirmed = False
+            self.end_probes = 0
             self.sample = {**self.sample, "status": "quota", "sync": "quota"}
             self.publish()
         if result.get("status") == "limited":
@@ -97,9 +131,37 @@ class Core:
         return result
 
     def snapshot(self):
-        return {**self.sample, "revision": self.revision, "accountRevision": self.account_revision,
-                "sampleAgeMs": int((time.monotonic() - self.sampled) * 1000) if self.sampled else 0,
-                "pending": self.pending, "sync": self.sample.get("sync", "loading")}
+        snapshot = {**self.sample, "revision": self.revision, "accountRevision": self.account_revision,
+                    "sampleAgeMs": int((time.monotonic() - self.sampled) * 1000) if self.sampled else 0}
+        action = self.pending.action if self.pending else None
+        frozen = self.pending.frozen_position if self.pending else None
+        if frozen is not None:
+            snapshot.update(progress=frozen, sampleAgeMs=0)
+        at_end = not action and self.end_probes > 0 and self.sample.get("sync") == "ok"
+        return {**snapshot, "pending": action, "positionFrozen": frozen is not None,
+                "transitioning": action in TRACK_COMMANDS or at_end,
+                "commandSync": "unconfirmed" if self.command_unconfirmed else None,
+                "sync": self.sample.get("sync", "loading")}
+
+    def end_delay(self, now):
+        duration, position = self.sample.get("duration"), self.sample.get("progress")
+        if (self.sample.get("sync") != "ok" or not self.sample.get("playing") or
+                not duration or position is None or self.end_probes >= 2):
+            return None
+        delay = 0.8 if self.end_probes else (duration - position) / 1000 + 0.2
+        return self.sampled + delay - now
+
+    def poll_delay(self):
+        if self.quota or not self.clients:
+            return None
+        now = time.monotonic()
+        if self.pending:
+            delay = self.pending.accepted_at + RECHECK_DELAYS[self.pending.checks] - now
+        else:
+            delay = ACTIVE_POLL_INTERVAL if self.sample.get("availability") == "active" else 25
+            if (end := self.end_delay(now)) is not None:
+                delay = min(delay, end)
+        return max(delay, self.poll_backoff, self.cooldown - now, 0)
 
     def publish(self, event="playback.changed", data=None):
         self.revision += 1
@@ -118,18 +180,41 @@ class Core:
             writer.write(frame)
 
     async def refresh(self):
+        end = self.end_delay(time.monotonic())
+        if end is not None and end <= 0.001:
+            self.end_probes += 1
         result = await self.call("sample")
         status = result["status"]
-        if status in ("track", "idle", "private", "unknown"):
+        valid = status in ("track", "idle", "private", "unknown")
+        now = time.monotonic()
+        previous_timestamp, timestamp = self.sample.get("timestamp"), result.get("timestamp")
+        outdated = (valid and self.sample.get("deviceId") == result.get("deviceId")
+                    and previous_timestamp is not None and timestamp is not None and timestamp < previous_timestamp)
+        if self.pending:
+            self.pending.checks += 1
+            if valid and not outdated and self.pending.confirmed(result):
+                self.pending = None
+            elif (not valid or result.get("deviceId") != self.pending.before.get("deviceId")
+                  or self.pending.checks >= len(RECHECK_DELAYS) or now - self.pending.accepted_at > 3):
+                self.pending = None
+                self.command_unconfirmed = True
+        elif not outdated:
+            self.command_unconfirmed = False
+
+        if valid and not outdated:
+            if (not result.get("playing") or result.get("uri") != self.sample.get("uri")
+                    or result.get("deviceId") != self.sample.get("deviceId") or rewound(self.sample, result)):
+                self.end_probes = 0
             self.sample = {**result, "auth": "connected", "sync": "ok"}
-            self.sampled = time.monotonic()
+            self.sampled = now
         elif status in ("disconnected", "setup_required", "reauthorize"):
             if self.sample.get("auth") == "connected":
                 self.account_revision += 1
                 self.cache.clear()
             self.sample = {"status": status, "auth": status, "sync": status}
             self.sampled = 0
-        else:
+            self.end_probes = 0
+        elif not valid:
             self.sample = {**self.sample, "status": status, "sync": status}
         self.poll_backoff = (min(300, max(30, result.get("retry", 0), 2 * self.poll_backoff))
                              if status == "unavailable" else 0)
@@ -137,20 +222,12 @@ class Core:
 
     async def poll(self):
         while True:
-            self.wake.clear()
-            if self.clients and not self.quota:
-                async with self.lock:
+            async with self.lock:
+                self.wake.clear()
+                if self.clients and not self.quota:
                     await self.refresh()
-                    if self.reconcile:
-                        self.reconcile -= 1
-                        if not self.reconcile:
-                            self.pending = None
-                            self.publish()
-            delay = (None if self.quota or not self.clients else
-                     max(self.poll_backoff, self.cooldown - time.monotonic(), 0.6 if self.reconcile else
-                         10 if self.sample.get("playing") else 25))
             try:
-                await asyncio.wait_for(self.wake.wait(), delay)
+                await asyncio.wait_for(self.wake.wait(), self.poll_delay())
             except TimeoutError:
                 pass
 
@@ -234,8 +311,18 @@ class Core:
         if result["status"] != "ok":
             self.wake.set()
             raise ValueError(result["status"])
-        self.pending = action
-        self.reconcile = 2
+        now = time.monotonic()
+        position = self.sample.get("progress")
+        if action == "pause" and position is not None and self.sample.get("playing"):
+            position += int(max(0, now - self.sampled) * 1000)
+            position = min(position, self.sample.get("duration") or position)
+        track_uri = params.get("uri") if action == "play" else None
+        if track_uri and not track_uri.startswith(("spotify:track:", "spotify:episode:")):
+            track_uri = None
+        self.pending = PendingPlayback(action, self.sample, now,
+                                       frozen_position=position if action == "pause" else None,
+                                       track_uri=track_uri)
+        self.command_unconfirmed = False
         self.publish()
         self.wake.set()
         return {"accepted": True}
@@ -301,7 +388,8 @@ class Core:
             self.sample = {"status": "loading" if status == "authorized" else status, "auth": status}
             self.sampled = 0
             self.pending = None
-            self.reconcile = 0
+            self.command_unconfirmed = False
+            self.end_probes = 0
             self.publish()
             self.wake.set()
         if method in ("save", "remove") and status == "ok":
@@ -339,9 +427,10 @@ class Core:
                     if len(seen) > 64:
                         seen.popitem(last=False)
                     if method == "subscribe":
+                        first = not self.clients
                         self.clients.add(writer)
                         result = self.snapshot()
-                        if not self.sampled or time.monotonic() - self.sampled >= 10:
+                        if first:
                             self.wake.set()
                     else:
                         try:

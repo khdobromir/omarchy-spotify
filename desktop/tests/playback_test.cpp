@@ -5,6 +5,19 @@
 class PlaybackTest : public QObject {
     Q_OBJECT
 private slots:
+    void remotePauseHoldUsesOnePositionUntilConfirmed() {
+        Playback playback;
+        QJsonObject sample = {{"sync", "ok"}, {"playing", true}, {"duration", 90'000}, {"progress", 20'000},
+                           {"sampleAgeMs", 650}, {"positionFrozen", true}};
+        playback.applyRemote(sample, 1000);
+        QCOMPARE(playback.position(1600), 20'000);
+        sample.insert("playing", false);
+        sample.insert("progress", 19'900);
+        sample.insert("positionFrozen", false);
+        playback.applyRemote(sample, 1600);
+        QCOMPARE(playback.position(2000), 19'900);
+    }
+
     void traceUpdatesPlayback() {
         Playback playback;
         QVERIFY(playback.apply("1 {\"type\":\"auth_state\",\"logged_in\":true}", 1000));

@@ -1,4 +1,6 @@
 {
+  "updatingPlayback": "Обновляю воспроизведение…",
+  "commandUnconfirmed": "Spotify пока не подтвердил команду.",
   "loading": "Проверяю Spotify…",
   "setup_required": "Сохрани Client ID Spotify в ~/.config/omarchy/spotify-client-id и нажми «Подключить Spotify».",
   "disconnected": "Подключи Spotify, чтобы видеть, что играет на твоих устройствах.",
