@@ -32,8 +32,6 @@ qt_add_qml_module(omarchy-spotify
     URI OmarchySpotify
     QML_FILES ${qml_sources}
 )
-set_source_files_properties(../spotify.py PROPERTIES QT_RESOURCE_ALIAS spotify.py)
-qt_add_resources(omarchy-spotify "spotify-helper" PREFIX "/" FILES ../spotify.py)
 qt_add_resources(omarchy-spotify "translations" PREFIX "/" BASE src FILES src/i18n/en.json src/i18n/ru.json)
 
 include(CTest)
@@ -46,17 +44,36 @@ if(BUILD_TESTING)
     add_test(NAME playback-test COMMAND playback-test)
     qt_add_executable(backend-test tests/backend_test.cpp src/backend.cpp src/backend.h src/playback.cpp)
     target_include_directories(backend-test PRIVATE src)
-    target_link_libraries(backend-test PRIVATE Qt6::Test Qt6::Qml)
+    target_link_libraries(backend-test PRIVATE Qt6::Test Qt6::Qml Qt6::Network)
     target_compile_definitions(backend-test PRIVATE
         PYTHON_EXECUTABLE="${Python3_EXECUTABLE}"
         FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixture.py"
     )
-    qt_add_resources(backend-test "test-spotify-helper" PREFIX "/" FILES ../spotify.py)
     add_test(NAME backend-test COMMAND backend-test)
     add_test(NAME routing-test COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/routing_test.py $<TARGET_FILE:omarchy-spotify>)
+    find_program(QUICKSHELL_EXECUTABLE NAMES qs quickshell)
+    if(QUICKSHELL_EXECUTABLE)
+        add_test(NAME widget-test COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/widget_test.py ${QUICKSHELL_EXECUTABLE})
+    endif()
 endif()
 
 install(TARGETS omarchy-spotify RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(FILES share/omarchy-spotify.desktop DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
 install(FILES TEMPLATE-LICENSE DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/omarchy-spotify)
+
+configure_file(share/omarchy-spotify-core.in omarchy-spotify-core @ONLY)
+configure_file(share/omarchy-spotify-open.in omarchy-spotify-open @ONLY)
+install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/omarchy-spotify-core
+                 ${CMAKE_CURRENT_BINARY_DIR}/omarchy-spotify-open
+        DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(FILES ../spotify_core.py ../spotify.py DESTINATION ${CMAKE_INSTALL_DATADIR}/omarchy-spotify)
+install(FILES share/omarchy-spotify.socket share/omarchy-spotify.service
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/systemd/user)
+option(OMARCHY_SPOTIFY_WIDGET "Stage the optional Omarchy integration" ON)
+if(OMARCHY_SPOTIFY_WIDGET)
+    install(FILES ../manifest.json ../Service.qml ../BarWidget.qml ../SpotifyCard.qml ../SpotifyLibrary.qml
+            DESTINATION ${CMAKE_INSTALL_DATADIR}/omarchy-spotify/widget)
+    install(DIRECTORY ../i18n DESTINATION ${CMAKE_INSTALL_DATADIR}/omarchy-spotify/widget)
+endif()

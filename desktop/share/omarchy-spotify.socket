@@ -1,0 +1,11 @@
+[Unit]
+Description=Omarchy Spotify Core IPC
+
+[Socket]
+ListenStream=%t/omarchy-spotify/core.sock
+DirectoryMode=0700
+SocketMode=0600
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

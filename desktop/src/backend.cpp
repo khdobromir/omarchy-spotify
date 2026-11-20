@@ -14,6 +14,8 @@
 
 namespace {
 Q_LOGGING_CATEGORY(metadataLog, "omarchy.spotify.metadata", QtWarningMsg)
+using namespace std::chrono_literals;
+constexpr qint64 coreFrameLimit = 256 * 1024;
 constexpr int maxLibraryOffset = 100'000;
 
 QByteArray readSmall(const QString &path, qint64 limit = 8192) {
@@ -59,8 +61,8 @@ void LibraryModel::append(const QVariantList &items) {
 
 Backend::Backend(QObject *parent)
     : QObject(parent), m_home(QStandardPaths::writableLocation(QStandardPaths::StateLocation)),
-      m_dataDir(m_home + "/soloist"), m_keyFile(m_home + "/soloist-key"),
-      m_helper(QDir::temp().filePath("omarchy-spotify-XXXXXX")) {
+      m_dataDir(m_home + "/soloist"), m_keyFile(m_home + "/soloist-key") {
+    m_clock.start();
     m_daemon.setStandardOutputFile(QProcess::nullDevice());
     m_daemon.setStandardErrorFile(QProcess::nullDevice());
     m_trace.setStandardErrorFile(QProcess::nullDevice());
@@ -83,6 +85,8 @@ Backend::Backend(QObject *parent)
     connect(&m_watch, &QFileSystemWatcher::directoryChanged, this, &Backend::tryTrace);
     connect(&m_daemon, &QProcess::started, this, &Backend::tryTrace);
     connect(&m_daemon, &QProcess::finished, this, [this](int code, QProcess::ExitStatus) {
+        if (!m_local)
+            return;
         if (code == 10)
             playerStopped("player_expired");
         else if (m_playerStatus == "player_connection" || m_playerStatus == "player_timeout")
@@ -91,35 +95,25 @@ Backend::Backend(QObject *parent)
             playerStopped("player_failed");
     });
     connect(&m_daemon, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
-        if (error == QProcess::FailedToStart)
+        if (m_local && error == QProcess::FailedToStart)
             playerStopped("player_failed");
     });
     connect(&m_trace, &QProcess::readyReadStandardOutput, this, &Backend::readTrace);
     connect(&m_trace, &QProcess::finished, this, [this](int, QProcess::ExitStatus) {
-        if (m_daemon.state() == QProcess::Running) {
+        if (m_local && m_daemon.state() == QProcess::Running) {
             playerStopped("player_connection");
             m_daemon.terminate();
         }
     });
     connect(&m_control, &QProcess::stateChanged, this, &Backend::playerChanged);
     connect(&m_control, &QProcess::finished, this, [this](int code, QProcess::ExitStatus status) {
-        controlFinished(code == 0 && status == QProcess::NormalExit);
+        if (m_local)
+            controlFinished(code == 0 && status == QProcess::NormalExit);
     });
     connect(&m_control, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
-        if (error == QProcess::FailedToStart)
+        if (m_local && error == QProcess::FailedToStart)
             controlFinished(false);
     });
-    for (WebJob *job : {&m_web, &m_trackWeb}) {
-        job->process.setStandardErrorFile(QProcess::nullDevice());
-        connect(&job->process, &QProcess::finished, this, [this, job](int, QProcess::ExitStatus) {
-            const QJsonDocument response = QJsonDocument::fromJson(job->process.readAllStandardOutput());
-            webFinished(*job, response.isObject() ? response.object() : QJsonObject{});
-        });
-        connect(&job->process, &QProcess::errorOccurred, this, [this, job](QProcess::ProcessError error) {
-            if (error == QProcess::FailedToStart)
-                webFinished(*job, {});
-        });
-    }
     m_webCooldown.setSingleShot(true);
     m_webCooldown.setTimerType(Qt::PreciseTimer);
     connect(&m_webCooldown, &QTimer::timeout, this, [this] {
@@ -127,20 +121,258 @@ Backend::Backend(QObject *parent)
         loadPending();
     });
 
-    QFile source(":/spotify.py");
-    if (source.open(QIODevice::ReadOnly) && m_helper.open()) {
-        const QByteArray contents = source.readAll();
-        if (m_helper.write(contents) == contents.size() && m_helper.flush())
-            m_helper.close();
+    m_core.setReadBufferSize(coreFrameLimit);
+    m_reconnect.setSingleShot(true);
+    connect(&m_reconnect, &QTimer::timeout, this, &Backend::connectCore);
+    connect(&m_core, &QLocalSocket::readyRead, this, &Backend::readCore);
+    connect(&m_core, &QLocalSocket::connected, this, [this] {
+        m_attempts = 0;
+        m_revision = -1;
+        m_backoff = {};
+        m_webCooldown.stop();
+        requestCore("subscribe", {}, [this](const QJsonObject &sample) {
+            if (!sample.contains("revision")) {
+                m_core.abort();
+                return;
+            }
+            m_coreReady = true;
+            applySample(sample);
+            loadPending();
+        }, 5s);
+    });
+    connect(&m_core, &QLocalSocket::errorOccurred, this, [this](QLocalSocket::LocalSocketError) {
+        m_reconnect.start(1000);
+        if (m_attempts == 1) {
+            const auto launcher = QStandardPaths::findExecutable("omarchy-spotify-core");
+            if (!launcher.isEmpty())
+                QProcess::startDetached(launcher, {});
+        }
+    });
+    connect(&m_core, &QLocalSocket::disconnected, this, [this] {
+        m_coreReady = false;
+        const auto pending = std::exchange(m_replies, {});
+        for (const auto &reply : pending)
+            reply({{"status", "unavailable"}});
+        m_sample = {};
+        if (!m_local) {
+            m_tick.stop();
+            m_playback = {};
+            setPlayerStatus("core_unavailable");
+            emit playbackChanged();
+        }
+        m_reconnect.start(1000);
+    });
+    QTimer::singleShot(0, this, &Backend::connectCore);
+}
+
+void Backend::connectCore() {
+    if (m_core.state() != QLocalSocket::UnconnectedState)
+        return;
+    ++m_attempts;
+    const auto runtime = QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation);
+    m_core.connectToServer(QDir(runtime).filePath("omarchy-spotify/core.sock"));
+    if (!m_local && !m_coreReady && m_attempts > 1)
+        setPlayerStatus("core_unavailable");
+}
+
+QString Backend::requestCore(const QString &method, const QJsonObject &params,
+                             std::function<void(const QJsonObject &)> done, std::chrono::milliseconds timeout) {
+    if (m_core.state() != QLocalSocket::ConnectedState || m_replies.size() >= 16)
+        return {};
+    const QString id = QString::number(++m_requestId);
+    const QJsonObject frame{{"version", 1}, {"id", id}, {"method", method}, {"params", params}};
+    if (m_core.write(QJsonDocument(frame).toJson(QJsonDocument::Compact) + '\n') < 0)
+        return {};
+    m_replies.insert(id, std::move(done));
+    QTimer::singleShot(timeout, this, [this, id] {
+        if (auto reply = m_replies.take(id))
+            reply({{"status", "unavailable"}});
+    });
+    return id;
+}
+
+void Backend::readCore() {
+    while (m_core.canReadLine()) {
+        const auto document = QJsonDocument::fromJson(m_core.readLine(coreFrameLimit));
+        const auto message = document.object();
+        if (!document.isObject() || message.value("version") != 1) {
+            m_core.abort();
+            return;
+        }
+        const auto event = message.value("event").toString();
+        if (event == "playback.changed") {
+            applySample(message.value("data").toObject());
+        } else if (event == "library.changed") {
+            const auto change = message.value("data").toObject();
+            m_roots.remove("tracks");
+            if (libraryContext() == "tracks")
+                reloadLibrary();
+            if (change.value("trackId").toString() == trackId(m_playback))
+                m_favorite = change.value("saved").toBool() ? 1 : 0;
+            emit libraryChanged();
+            loadPending();
+        } else if (auto reply = m_replies.take(message.value("id").toString())) {
+            const auto result = message.value("ok").toBool()
+                ? message.value("result").toObject()
+                : QJsonObject{{"status", message.value("error").toObject().value("code")}};
+            reply(result);
+        }
     }
-    QTimer::singleShot(0, this, [this] {
-        startPlayer();
-        loadPending();
+    if (m_core.bytesAvailable() >= coreFrameLimit - 1)
+        m_core.abort();
+}
+
+void Backend::clearAccount() {
+    m_roots.clear();
+    m_collections.clear();
+    m_metadata.clear();
+    m_checkedTrack.clear();
+    m_favorite = -1;
+    m_devices.clear();
+    m_queue.clear();
+    dismissSelection();
+    reloadLibrary();
+}
+
+void Backend::applySample(const QJsonObject &sample) {
+    const auto revision = sample.value("revision").toInteger(-1);
+    if (revision < 0 || revision <= m_revision)
+        return;
+    const bool restarted = m_revision < 0 && m_accountRevision >= 0;
+    m_revision = revision;
+    const auto account = sample.value("accountRevision").toInteger();
+    if (restarted || (m_accountRevision >= 0 && account != m_accountRevision))
+        clearAccount();
+    m_accountRevision = account;
+    m_sample = sample;
+    if (!m_local) {
+        const auto oldTrack = m_playback.uri;
+        m_playback.applyRemote(sample, m_clock.elapsed());
+        const auto sync = sample.value("sync").toString();
+        setPlayerStatus(sync == "ok" ? (m_playback.loggedIn ? "ready" : "no_device") : sync);
+        if (m_playback.status == "playing")
+            m_tick.start();
+        else
+            m_tick.stop();
+        if (oldTrack != m_playback.uri) {
+            m_checkedTrack.clear();
+            m_favorite = -1;
+            emit libraryChanged();
+        }
+        emit playbackChanged();
+        emit positionChanged();
+        emit playerChanged();
+        playPending();
+    }
+    loadPending();
+    checkFavorite();
+}
+
+void Backend::remoteCommand(const QString &method, QJsonObject params) {
+    if (m_remoteBusy || !m_coreReady)
+        return;
+    if (method != "transfer") {
+        if (!m_playback.loggedIn) {
+            setPlayerStatus("no_device");
+            return;
+        }
+        params.insert("deviceId", m_sample.value("deviceId"));
+    }
+    m_remoteBusy = !requestCore("playback." + method, params, [this, method](const QJsonObject &result) {
+        m_remoteBusy = false;
+        if (!m_local) {
+            if (!result.value("accepted").toBool())
+                setPlayerStatus(result.value("status").toString("action_failed"));
+            if (method == "play" && m_selectionStatus == "sent")
+                m_selectionStatus = result.value("accepted").toBool() ? QString{} : QString("failed");
+        }
+        emit playerChanged();
+    }).isEmpty();
+    emit playerChanged();
+}
+
+void Backend::refreshDevices() {
+    requestCore("devices", {}, [this](const QJsonObject &result) {
+        m_devices = result.value("devices").toArray().toVariantList();
+        if (result.value("status") != "ok")
+            setPlayerStatus(result.value("status").toString("unavailable"));
+        emit playerChanged();
     });
 }
 
+void Backend::refreshQueue() {
+    m_queue.clear();
+    emit playerChanged();
+    requestCore("queue", {}, [this](const QJsonObject &result) {
+        m_queue = result.value("items").toArray().toVariantList();
+        if (result.value("status") != "ok")
+            setPlayerStatus(result.value("status").toString("unavailable"));
+        emit playerChanged();
+    });
+}
+
+void Backend::setShuffle(bool state) {
+    if (!m_local)
+        remoteCommand("shuffle", {{"state", state}});
+}
+
+void Backend::setRepeat(const QString &state) {
+    if (!m_local)
+        remoteCommand("repeat", {{"state", state}});
+}
+
+void Backend::setVolume(int volume) {
+    if (!m_local)
+        remoteCommand("volume", {{"volume", volume}});
+}
+
+void Backend::transfer(const QString &device) {
+    if (!m_local)
+        remoteCommand("transfer", {{"deviceId", device}});
+}
+
+void Backend::preferDevice(const QString &device) {
+    requestCore("preferDevice", {{"deviceId", device}}, [this](const QJsonObject &result) {
+        if (result.value("status") == "ok")
+            refreshDevices();
+        else
+            setPlayerStatus(result.value("status").toString("unavailable"));
+    });
+}
+
+void Backend::disconnectAccount() {
+    webRequest("disconnect");
+}
+
+void Backend::setLocalMode(bool enabled) {
+    if (m_local == enabled || (enabled && m_daemon.state() != QProcess::NotRunning))
+        return;
+    m_local = enabled;
+    dismissSelection();
+    m_tick.stop();
+    m_playback = {};
+    m_checkedTrack.clear();
+    m_favorite = -1;
+    if (enabled) {
+        startPlayer();
+    } else {
+        for (auto *process : {&m_control, &m_trace, &m_daemon})
+            process->terminate();
+        const auto sample = m_sample;
+        m_revision = -1;
+        m_accountRevision = -1;
+        if (sample.isEmpty())
+            setPlayerStatus("core_unavailable");
+        else
+            applySample(sample);
+    }
+    emit playbackChanged();
+    emit playerChanged();
+}
+
 Backend::~Backend() {
-    for (QProcess *process : {&m_control, &m_trace, &m_daemon, &m_web.process, &m_trackWeb.process}) {
+    m_core.disconnect(this);
+    for (QProcess *process : {&m_control, &m_trace, &m_daemon}) {
         process->disconnect(this);
         if (process->state() != QProcess::NotRunning) {
             process->terminate();
@@ -159,11 +391,19 @@ QVariantMap Backend::playback() const {
                 && (!m_metadataAttempted || (!m_trackWeb.operation.isEmpty()
                                            && m_webMetadataGeneration == m_metadataGeneration))},
             {"uri", m_playback.uri}, {"title", m_playback.title}, {"artist", m_playback.artist}, {"album", m_playback.album},
+            {"device", m_local ? (m_playback.loggedIn ? QString("Omarchy Spotify") : QString{})
+                               : m_sample.value("device").toString()},
+            {"pending", m_local ? QString{} : m_sample.value("pending").toString()},
+            {"shuffle", m_sample.value("shuffle").toVariant()},
+            {"repeat", m_sample.value("repeat").toString()},
+            {"volume", m_sample.value("capabilities").toObject().value("volume").toVariant()},
+            {"supportsVolume", !m_local && m_sample.value("capabilities").toObject().value("supportsVolume").toBool()},
+            {"disallows", m_local ? QVariantList{} : m_sample.value("disallows").toArray().toVariantList()},
             {"art", m_playback.art}, {"artHigh", m_playback.artHigh}, {"duration", m_playback.duration}};
 }
 
 int Backend::position() const {
-    return m_playback.position(QDateTime::currentMSecsSinceEpoch());
+    return m_playback.position(m_local ? QDateTime::currentMSecsSinceEpoch() : m_clock.elapsed());
 }
 
 void Backend::setPlayerStatus(const QString &status) {
@@ -175,7 +415,7 @@ void Backend::setPlayerStatus(const QString &status) {
 
 void Backend::saveKey(const QString &input) {
     const QByteArray key = input.trimmed().toUtf8();
-    if (key.isEmpty() || key.size() > 8192 || key.contains('\n')
+    if (!m_local || key.isEmpty() || key.size() > 8192 || key.contains('\n')
         || m_daemon.state() != QProcess::NotRunning)
         return;
     QSaveFile file(m_keyFile);
@@ -189,7 +429,7 @@ void Backend::saveKey(const QString &input) {
 }
 
 void Backend::startPlayer() {
-    if (m_daemon.state() != QProcess::NotRunning)
+    if (!m_local || m_daemon.state() != QProcess::NotRunning)
         return;
     m_soloist = QStandardPaths::findExecutable("soloist");
     const QString local = QDir::home().filePath(".local/bin/soloist");
@@ -292,9 +532,15 @@ void Backend::command(const QStringList &args) {
     m_control.start(m_soloist, QStringList{"ctl"} + args + QStringList{"--data-dir", m_dataDir});
 }
 
-void Backend::play(const QString &uri) {
-    if (uri.isEmpty())
-        command({"play"});
+void Backend::play(const QString &uri, int offset) {
+    if (uri.isEmpty()) {
+        if (m_local)
+            command({"play"});
+        else
+            remoteCommand("resume");
+    } else if (!m_local && offset >= 0 && !m_collectionUri.isEmpty()) {
+        remoteCommand("play", {{"uri", uri}, {"context", m_collectionUri}, {"offset", offset}});
+    }
     else if (Playback::playableUri(uri)) {
         m_selectedUri = m_pendingPlay = uri;
         m_selection.clear();
@@ -350,7 +596,22 @@ void Backend::refreshMetadata() {
 }
 
 void Backend::playPending() {
-    if (m_pendingPlay.isEmpty() || commandBusy() || !m_playback.loggedIn)
+    if (m_pendingPlay.isEmpty() || commandBusy())
+        return;
+    if (!m_local) {
+        if (!m_coreReady || m_sample.value("sync") == "loading" || m_sample.isEmpty())
+            return;
+        if (!m_playback.loggedIn) {
+            m_pendingPlay.clear();
+            m_selectionStatus = "failed";
+            emit playerChanged();
+            return;
+        }
+        m_selectionStatus = "sent";
+        remoteCommand("play", {{"uri", std::exchange(m_pendingPlay, {})}});
+        return;
+    }
+    if (!m_playback.loggedIn)
         return;
     m_activePlay = std::exchange(m_pendingPlay, {});
     if (m_selectionStatus != "inspecting") {
@@ -408,30 +669,44 @@ void Backend::updateSelection() {
 }
 
 void Backend::togglePlayback() {
-    if (m_playback.status == "playing")
+    if (!m_local)
+        remoteCommand(m_playback.status == "playing" ? "pause" : "resume");
+    else if (m_playback.status == "playing")
         command({"pause"});
     else
         play();
 }
 
 void Backend::skip(bool next) {
-    command({next ? "next" : "prev"});
+    if (m_local)
+        command({next ? "next" : "prev"});
+    else
+        remoteCommand(next ? "next" : "previous");
 }
 
 void Backend::seek(int at, const QString &uri) {
-    if (!uri.isEmpty() && m_playback.uri == uri && m_playback.duration > 0)
-        command({"seek", QString::number(std::clamp(at, 0, m_playback.duration - 1))});
+    if (uri.isEmpty() || m_playback.uri != uri || m_playback.duration <= 0)
+        return;
+    const int position = std::clamp(at, 0, m_playback.duration - 1);
+    if (m_local)
+        command({"seek", QString::number(position)});
+    else
+        remoteCommand("seek", {{"position", position}, {"uri", uri}});
 }
 
 bool Backend::webRequest(const QString &operation, const QStringList &args) {
     WebJob &job = operation == "track" || operation == "episode" ? m_trackWeb : m_web;
     if (!job.operation.isEmpty() || webCoolingDown())
         return false;
-    if (m_helper.fileName().isEmpty() || m_helper.isOpen())
+    if (!m_coreReady)
+        return false;
+    job.id = requestCore(operation, {{"args", QJsonArray::fromStringList(args)}},
+                         [this, job = &job](const QJsonObject &result) { webFinished(*job, result); },
+                         operation == "connect" ? 195s : 20s);
+    if (job.id.isEmpty())
         return false;
     job.operation = operation;
     job.arguments = args;
-    job.process.start("python3", QStringList{"-B", m_helper.fileName(), operation} + args);
     if (&job == &m_web)
         emit libraryChanged();
     return true;
@@ -547,11 +822,13 @@ void Backend::loadMetadata() {
         if (m_webMetadataGeneration != 0 && requested != m_playback.uri
             && m_playback.needsMetadata() && !m_metadataAttempted && requested != m_selectedUri) {
             qCDebug(metadataLog) << "Cancelled superseded track request" << requested;
-            m_trackWeb.process.kill();
+            m_replies.remove(m_trackWeb.id);
+            m_trackWeb.operation.clear();
+        } else {
+            return;
         }
-        return;
     }
-    if (m_playback.needsMetadata() && !m_metadataAttempted) {
+    if (m_local && m_playback.needsMetadata() && !m_metadataAttempted) {
         m_metadataAttempted = true;
         m_webMetadataGeneration = m_metadataGeneration;
         const QString kind = m_playback.uri.section(':', 1, 1);
@@ -564,13 +841,15 @@ void Backend::loadMetadata() {
         m_webMetadataGeneration = 0;
         m_lookupSelection = false;
         // The same URI is already pending or has been tried for the active track.
-        if (m_selectedUri != m_playback.uri)
+        if (!m_local || m_selectedUri != m_playback.uri)
             webRequest("track", {m_selectedUri.mid(14)});
         emit selectionChanged();
     }
 }
 
 void Backend::loadPending() {
+    if (!m_coreReady)
+        return;
     loadMetadata();
     if (webBusy())
         return;
@@ -600,7 +879,7 @@ void Backend::toggleFavorite() {
 
 void Backend::checkFavorite() {
     const QString id = trackId(m_playback);
-    if (m_context.next != 0 && !id.isEmpty() && m_checkedTrack != id
+    if (!id.isEmpty() && m_checkedTrack != id
         && webRequest("favorite", {id}))
         m_checkedTrack = id;
 }
@@ -675,11 +954,7 @@ void Backend::webFinished(WebJob &job, const QJsonObject &result) {
     } else if (status == "ok") {
         if (arguments.value(0) == trackId(m_playback))
             m_favorite = result.value("saved").toBool() ? 1 : 0;
-        if (operation == "save" || operation == "remove") {
-            m_roots.remove("tracks");
-            if (libraryContext() == "tracks")
-                reloadLibrary();
-        }
+
     }
     emit libraryChanged();
     loadPending();

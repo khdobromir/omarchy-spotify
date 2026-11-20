@@ -1,0 +1,8 @@
+[Unit]
+Description=Omarchy Spotify Core
+Requires=omarchy-spotify.socket
+After=omarchy-spotify.socket
+
+[Service]
+ExecStart=%h/.local/bin/omarchy-spotify-core
+UMask=0077

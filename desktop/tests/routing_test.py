@@ -1,4 +1,4 @@
-"""Exercise the real desktop executable with isolated local-player and Web API fixtures."""
+"""Exercise desktop activation and remote routing against a Unix-socket fixture."""
 import json
 import os
 from pathlib import Path
@@ -35,10 +35,16 @@ class RoutingTest(unittest.TestCase):
         self.env["PATH"] = str(self.root / "omarchy-spotify-bin") + ":" + self.env["PATH"]
         state = self.root / "omarchy-spotify"
         (state / "soloist-key").write_text("fixture")
-        for name in ("soloist", "python3"):
+        for name in ("soloist",):
             path = self.root / name
             path.write_text("#!" + PYTHON + "\n" + HELPER)
             path.chmod(0o700)
+        core = subprocess.Popen([PYTHON, Path(__file__).with_name("fixture.py")], env=self.env)
+        self.addCleanup(self.stop, core)
+        deadline = time.monotonic() + 2
+        while not (state / "core.sock").exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue((state / "core.sock").exists())
 
     def start(self, *args):
         process = subprocess.Popen([APP, *args], env=self.env, stderr=subprocess.PIPE)
@@ -70,10 +76,9 @@ class RoutingTest(unittest.TestCase):
             time.sleep(0.03)
         self.fail(f"{entry!r} missing in {name}: {self.log(name)!r}")
 
-    def test_cold_track_waits_for_soloist_and_collection_launches_only_browse(self):
+    def test_cold_track_targets_phone_and_collection_launches_only_browse(self):
         app = self.start("--play-track", TRACK)
-        self.await_log("played", ["play", TRACK])
-        daemon = (self.root / "daemon").read_text()
+        self.await_log("played", ["play", TRACK, "phone"])
         for collection in (ALBUM, PLAYLIST):
             result = self.launch("--open-album" if collection == ALBUM else "--open-playlist", collection)
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -81,22 +86,22 @@ class RoutingTest(unittest.TestCase):
         self.assertEqual(self.launch("--activate").returncode, 0)
         self.assertEqual(self.launch("--open-track", TRACK).returncode, 0)
         self.assertEqual(app.poll(), None)
-        self.assertEqual((self.root / "daemon").read_text(), daemon)
-        self.assertEqual(self.log("played"), [["play", TRACK]])
+        self.assertFalse((self.root / "daemon").exists())
+        self.assertEqual(self.log("played"), [["play", TRACK, "phone"]])
 
     def test_widget_launcher_cold_then_warm(self):
         result = subprocess.run([PYTHON, Path(__file__).resolve().parents[2] / "spotify.py",
                                  "desktop", "--play-track", TRACK],
                                 env=self.env, capture_output=True, timeout=8)
         self.assertEqual(json.loads(result.stdout), {"status": "ok"})
-        self.await_log("played", ["play", TRACK])
+        self.await_log("played", ["play", TRACK, "phone"])
         app_pid = int((self.root / "omarchy-spotify.lock").read_text().splitlines()[0])
         self.addCleanup(os.kill, app_pid, 15)
         result = subprocess.run([PYTHON, Path(__file__).resolve().parents[2] / "spotify.py",
                                  "desktop", "--open-track", TRACK],
                                 env=self.env, capture_output=True, timeout=8)
         self.assertEqual(json.loads(result.stdout), {"status": "ok"})
-        self.assertEqual(self.log("played"), [["play", TRACK]])
+        self.assertEqual(self.log("played"), [["play", TRACK, "phone"]])
 
     def test_invalid_command_is_rejected(self):
         for command in ("https://example.org", TRACK + "\n", "--unexpected", "spotify:episode:" + "x" * 22):
@@ -121,11 +126,10 @@ class RoutingTest(unittest.TestCase):
 
     def test_locked_instance_without_socket_does_not_start_another_player(self):
         self.start(TRACK)
-        self.await_log("played", ["play", TRACK])
-        daemon = (self.root / "daemon").read_text()
+        self.await_log("played", ["play", TRACK, "phone"])
         (self.root / "omarchy-spotify.sock").unlink()
         self.assertNotEqual(self.launch("--activate").returncode, 0)
-        self.assertEqual((self.root / "daemon").read_text(), daemon)
+        self.assertFalse((self.root / "daemon").exists())
 
 
 if __name__ == "__main__":

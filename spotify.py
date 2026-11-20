@@ -10,6 +10,7 @@ import re
 import secrets
 import select
 import shutil
+import stat
 import subprocess
 import sys
 from tempfile import NamedTemporaryFile
@@ -26,7 +27,6 @@ API_URL = "https://api.spotify.com/v1"
 PLAYER_URL = API_URL + "/me/player"
 SCOPES = frozenset(("user-read-playback-state", "user-modify-playback-state",
                     "user-library-read", "user-library-modify", "playlist-read-private"))
-PLAYER_METHODS = {"next": "POST", "previous": "POST", "pause": "PUT", "play": "PUT", "seek": "PUT"}
 LIBRARY_TYPES = {"tracks": "track", "albums": "album", "playlists": "playlist"}
 PAGE_SIZE = 20
 MAX_OFFSET = 100_000
@@ -50,12 +50,18 @@ def read_json(response, limit=MAX_RESPONSE):
     return json.loads(data) if data else {}
 
 
-def request_json(url, *, form=None, token=None, method=None, limit=MAX_RESPONSE):
+def request_json(url, *, form=None, body=None, token=None, method=None, limit=MAX_RESPONSE, empty_as_none=False):
     data = urlencode(form).encode() if form is not None else None
-    request = Request(url, data=data, headers={"Accept": "application/json"}, method=method)
+    headers = {"Accept": "application/json"}
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    request = Request(url, data=data, headers=headers, method=method)
     if token:
         request.add_header("Authorization", f"Bearer {token}")
     with build_opener(NoRedirects).open(request, timeout=7) as response:
+        if empty_as_none and response.status == 204:
+            return None
         return read_json(response, limit)
 
 
@@ -107,43 +113,6 @@ def artwork(images):
     return {"art": medium[1], "artHigh": high[1]}
 
 
-def playback_sample(data):
-    data = record(data)
-    device = record(data.get("device"))
-    track = record(data.get("item"))
-    title = label(track.get("name"))
-    track_id = item_id(track.get("id"))
-    if (device.get("is_private_session") is True or track.get("type") != "track"
-            or not title or not track_id):
-        return {"status": "idle"}
-
-    album = record(track.get("album"))
-
-    duration = milliseconds(track.get("duration_ms"))
-    progress = milliseconds(data.get("progress_ms"))
-    if progress is not None and duration is not None:
-        progress = min(progress, duration)
-    actions = record(data.get("actions"))
-    disallows = record(actions.get("disallows")) or actions
-    return {
-        "status": "track",
-        "trackId": track_id,
-        "title": title,
-        "artist": artist_label(track),
-        "album": label(album.get("name")),
-        "device": label(device.get("name")),
-        "deviceId": (device_id(device.get("id"))
-                     if device.get("is_restricted") is not True and device.get("is_active") is not False else ""),
-        "disallows": [action for action in ("skipping_next", "skipping_prev", "pausing", "resuming", "seeking")
-                      if disallows.get(action) is True],
-        "art": artwork(album.get("images")).get("art", ""),
-        "url": f"https://open.spotify.com/track/{track_id}",
-        "playing": data.get("is_playing") is True,
-        "duration": duration,
-        "progress": progress,
-    }
-
-
 def library_item(item, kind, inherited_art=None):
     identity, title = item_id(item.get("id")), label(item.get("name"))
     if not identity or not title or item.get("is_local") is True:
@@ -157,6 +126,46 @@ def library_item(item, kind, inherited_art=None):
             "duration": milliseconds(item.get("duration_ms")),
             **(artwork(images) or inherited_art or {})}
 
+
+
+def remote_device(device):
+    return {"id": device_id(device.get("id")) or None, "name": label(device.get("name")),
+            "type": label(device.get("type")), "active": device.get("is_active") is True,
+            "private": device.get("is_private_session") is True,
+            "restricted": device.get("is_restricted") is True,
+            "supportsVolume": device.get("supports_volume") is True,
+            "volume": device.get("volume_percent") if type(device.get("volume_percent")) is int else None}
+
+
+def remote_sample(raw):
+    data = record(raw)
+    device = remote_device(record(data.get("device")))
+    private = device["private"]
+    item = record(data.get("item")) if not private else {}
+    kind = item.get("type")
+    track = library_item(item, kind) if kind in ("track", "episode") else None
+    actions = record(data.get("actions"))
+    flags = record(actions.get("disallows")) or actions
+    playing = data.get("is_playing")
+    item_type = kind or data.get("currently_playing_type")
+    shuffle = data.get("shuffle_state")
+    repeat = data.get("repeat_state")
+    duration = milliseconds(item.get("duration_ms"))
+    progress = milliseconds(data.get("progress_ms")) if not private else None
+    return {"status": "private" if private else "track" if track else "idle" if raw is None else "unknown",
+            "availability": "active" if device["active"] else "idle" if raw is None else "unknown",
+            "itemType": label(item_type) or None,
+            "uri": track["uri"] if track else None,
+            "trackId": item_id(item.get("id")) if kind == "track" else "",
+            "title": track["title"] if track else "", "artist": track["subtitle"] if track else "",
+            "album": label(record(item.get("album" if kind == "track" else "show")).get("name")),
+            "art": track.get("art", "") if track else "", "artHigh": track.get("artHigh", "") if track else "",
+            "device": device["name"], "deviceId": device["id"], "capabilities": device,
+            "playing": playing if type(playing) is bool else None, "duration": duration,
+            "progress": min(progress, duration) if progress is not None and duration is not None else progress,
+            "shuffle": shuffle if type(shuffle) is bool else None,
+            "repeat": repeat if repeat in ("off", "context", "track") else None,
+            "disallows": [name for name, forbidden in flags.items() if forbidden is True and len(name) <= 40][:24]}
 
 def page_items(data):
     entries = data.get("items")
@@ -208,14 +217,34 @@ def collection_page(kind, identity, offset, token):
     art = artwork(item.get("images")) if not playlist else None
     tracks = (record(entry.get("item", entry.get("track"))) if playlist else entry
               for entry in page_items(data))
-    items = (library_item(track, track.get("type") or "track", art)
-             for track in tracks if track.get("type") in (None, "track", "episode"))
+    items = ({**entry, "offset": offset + index}
+             for index, track in enumerate(tracks)
+             if track.get("type") in (None, "track", "episode")
+             and (entry := library_item(track, track.get("type") or "track", art)))
     return {**page_result(data, items, offset), "collection": collection}
 
 
 def perform(command, args, token):
-    if command == "status":
-        return playback_sample(request_json(PLAYER_URL, token=token))
+    if command == "sample":
+        return remote_sample(request_json(PLAYER_URL + "?additional_types=track,episode",
+                                          token=token, empty_as_none=True))
+    if command == "devices":
+        data = record(request_json(PLAYER_URL + "/devices", token=token))
+        if not isinstance(data.get("devices"), list):
+            raise ValueError("Invalid device list")
+        return {"status": "ok", "devices": [remote_device(record(item)) for item in data["devices"][:64]]}
+    if command == "queue":
+        data = record(request_json(PLAYER_URL + "/queue", token=token))
+        if not isinstance(data.get("queue"), list):
+            raise ValueError("Invalid queue response")
+        return {"status": "ok", "items": [item for raw in data["queue"][:100]
+                if (entry := record(raw)).get("type") in ("track", "episode")
+                and (item := library_item(entry, entry["type"]))]}
+    if command == "player":
+        suffix, params, method, body = args
+        query = "?" + urlencode(params) if params else ""
+        request_json(PLAYER_URL + suffix + query, token=token, method=method, body=body)
+        return {"status": "ok"}
     if command == "library" and len(args) == 2 and args[0] in LIBRARY_TYPES and re.fullmatch(r"[0-9]{1,6}", args[1]):
         offset = int(args[1])
         if offset <= MAX_OFFSET:
@@ -243,20 +272,6 @@ def perform(command, args, token):
             return {"status": "ok", "saved": saved[0]}
         request_json(url + query, method="PUT" if command == "save" else "DELETE", token=token)
         return {"status": "ok", "saved": command == "save"}
-    if command in PLAYER_METHODS and args and device_id(args[0]):
-        params = {"device_id": args[0]}
-        if command == "seek":
-            if len(args) != 3 or not item_id(args[1]) or not re.fullmatch(r"[0-9]{1,8}", args[2]):
-                return {"status": "action_failed"}
-            sample = playback_sample(request_json(PLAYER_URL, token=token))
-            if (sample.get("trackId") != args[1] or sample.get("deviceId") != args[0]
-                    or not sample["duration"] or "seeking" in sample["disallows"]):
-                return {"status": "target_changed"}
-            params["position_ms"] = max(1, min(int(args[2]), sample["duration"] - 1))
-        elif len(args) != 1:
-            return {"status": "action_failed"}
-        request_json(f"{PLAYER_URL}/{command}?{urlencode(params)}", method=PLAYER_METHODS[command], token=token)
-        return {"status": "ok"}
     return {"status": "action_failed"}
 
 
@@ -274,10 +289,16 @@ def load_client_id():
 
 def load_tokens():
     try:
-        with TOKEN_FILE.open("rb") as file:
-            return read_json(file)
+        fd = os.open(TOKEN_FILE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
         return None
+    with os.fdopen(fd, "rb") as file:
+        info = os.fstat(file.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise ValueError("Unexpected token file")
+        if info.st_mode & 0o077:
+            os.fchmod(file.fileno(), 0o600)
+        return read_json(file)
 
 
 @contextmanager
@@ -356,8 +377,14 @@ def account_operation(client_id, command, args):
     tokens = session_tokens(client_id)
     if tokens is None:
         return {"status": "disconnected"}
-    needs_scope = command not in ("status", "track", "episode")
-    if needs_scope and not has_extended_scope(tokens):
+    needed = {"player": "user-modify-playback-state", "library": "user-library-read",
+              "collection": "playlist-read-private", "favorite": "user-library-read",
+              "save": "user-library-modify", "remove": "user-library-modify"}.get(command)
+    if command == "library" and args[0] == "playlists":
+        needed = "playlist-read-private"
+    if command == "collection" and args[0].startswith("spotify:album:"):
+        needed = None
+    if needed and needed not in str(tokens.get("scope", "")).split():
         return {"status": "reauthorize"}
     try:
         result = perform(command, args, tokens["access_token"])
@@ -368,10 +395,10 @@ def account_operation(client_id, command, args):
         tokens = session_tokens(client_id, rejected=tokens["access_token"])
         if tokens is None:
             return {"status": "disconnected"}
-        if needs_scope and not has_extended_scope(tokens):
+        if needed and needed not in str(tokens.get("scope", "")).split():
             return {"status": "reauthorize"}
         result = perform(command, args, tokens["access_token"])
-    if command == "status":
+    if command == "sample":
         result["extended"] = has_extended_scope(tokens)
     return result
 
@@ -514,26 +541,23 @@ def main(command, *args):
             with token_lock():
                 TOKEN_FILE.unlink(missing_ok=True)
             return {"status": "disconnected"}
-        elif command not in ("connect", "status", "library", "collection", "track", "episode", "favorite", "save", "remove") and command not in PLAYER_METHODS:
+        elif command != "connect":
             raise ValueError("Unknown command")
         client_id = load_client_id()
         if client_id is None:
             return {"status": "setup_required"}
-        return connect(client_id) if command == "connect" else account_operation(client_id, command, args)
+        return connect(client_id)
     except HTTPError as error:
-        if command in PLAYER_METHODS and error.code in (403, 404):
-            error.close()
-            return {"status": "no_device" if error.code == 404 else "action_forbidden"}
         return http_failure(error)
     except (OSError, ValueError, KeyError, TypeError):
         if command == "desktop":
             return {"status": "desktop_failed"}
-        if command == "status":
-            return {"status": "unavailable", "retry": 30}
         if command == "connect":
             return {"status": "auth_error"}
         return {"status": "disconnect_error" if command == "disconnect" else "action_failed"}
 
 
 if __name__ == "__main__":
+    if len(sys.argv) < 2 or sys.argv[1] != "desktop":
+        raise SystemExit("Run Spotify API operations through Spotify Core.")
     print(json.dumps(main(*sys.argv[1:])))

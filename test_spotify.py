@@ -16,35 +16,22 @@ class SpotifyTests(unittest.TestCase):
     def test_upgrade_preserves_playback_and_requires_consent_for_new_actions(self):
         tokens = {"client_id": CLIENT_ID, "access_token": "old", "expires_at": 2**40}
         with patch.object(spotify, "load_tokens", return_value=tokens), patch.object(
-            spotify, "request_json", return_value={}
+            spotify, "request_json", return_value=None
         ) as request:
-            self.assertEqual(spotify.account_operation(CLIENT_ID, "status", ()),
-                             {"status": "idle", "extended": False})
-            self.assertEqual(spotify.account_operation(CLIENT_ID, "next", ("test-device",)),
+            sample = spotify.account_operation(CLIENT_ID, "sample", ())
+            self.assertEqual(sample["status"], "idle")
+            self.assertFalse(sample["extended"])
+            self.assertEqual(spotify.account_operation(CLIENT_ID, "player", ("/next", {}, "POST", None)),
                              {"status": "reauthorize"})
             request.assert_called_once()
 
-    def test_playback_commands_and_stale_seek(self):
+    def test_player_encodes_device_and_sends_json_body(self):
+        body = {"uris": ["spotify:track:" + "a" * 22]}
         with patch.object(spotify, "request_json", return_value={}) as request:
-            for command, method in (("next", "POST"), ("previous", "POST"),
-                                    ("pause", "PUT"), ("play", "PUT")):
-                with self.subTest(command=command):
-                    self.assertEqual(spotify.perform(command, ("device+1",), "test"),
-                                     {"status": "ok"})
-                    request.assert_called_with(spotify.PLAYER_URL + "/" + command + "?device_id=device%2B1",
-                                               method=method, token="test")
-            request.reset_mock()
-            self.assertEqual(spotify.perform("seek", ("device", "a" * 22, "42000"), "test"),
-                             {"status": "target_changed"})
-            request.assert_called_once_with(spotify.PLAYER_URL, token="test")
-            request.return_value = {
-                "device": {"id": "device", "is_active": True},
-                "item": {"id": "a" * 22, "type": "track", "name": "Song", "duration_ms": 42000},
-            }
-            self.assertEqual(spotify.perform("seek", ("device", "a" * 22, "43000"), "test"),
+            self.assertEqual(spotify.perform("player", ("/play", {"device_id": "device+1"}, "PUT", body), "test"),
                              {"status": "ok"})
-            request.assert_called_with(spotify.PLAYER_URL + "/seek?device_id=device&position_ms=41999",
-                                       method="PUT", token="test")
+            request.assert_called_once_with(spotify.PLAYER_URL + "/play?device_id=device%2B1",
+                                            method="PUT", token="test", body=body)
 
     def test_favorite_uses_library_uri_and_explicit_mutation(self):
         track_id = "a" * 22
@@ -169,7 +156,6 @@ class SpotifyTests(unittest.TestCase):
         with TemporaryDirectory() as folder, patch.object(
             spotify, "CLIENT_ID_FILE", Path(folder) / "spotify-client-id"
         ), patch.object(spotify, "connect") as connect:
-            self.assertEqual(spotify.main("status"), {"status": "setup_required"})
             spotify.CLIENT_ID_FILE.write_text("invalid id\n", encoding="utf-8")
             self.assertEqual(spotify.main("connect"), {"status": "setup_required"})
             connect.assert_not_called()
@@ -201,18 +187,20 @@ class SpotifyTests(unittest.TestCase):
         }
         sample = {"item": track, "progress_ms": 200000, "is_playing": True,
                   "device": {"name": "Phone"}}
-        result = spotify.playback_sample(sample)
+        result = spotify.remote_sample(sample)
         self.assertEqual(result["title"], "<b>Literal</b>")
         self.assertEqual(result["artist"], "Artist Name")
         self.assertEqual(result["progress"], 180500)
         self.assertEqual(result["art"], "https://i.scdn.co/image/abcd")
         self.assertEqual(result["device"], "Phone")
-        self.assertEqual(result["url"], "https://open.spotify.com/track/" + "a" * 22)
+        self.assertEqual(result["uri"], "spotify:track:" + "a" * 22)
         sample["progress_ms"] = None
-        self.assertIsNone(spotify.playback_sample(sample)["progress"])
+        self.assertIsNone(spotify.remote_sample(sample)["progress"])
         sample["device"]["is_private_session"] = True
-        self.assertEqual(spotify.playback_sample(sample), {"status": "idle"})
-        self.assertEqual(spotify.playback_sample({"item": None}), {"status": "idle"})
+        self.assertEqual(spotify.remote_sample(sample)["status"], "private")
+        self.assertIsNone(spotify.remote_sample(sample)["uri"])
+        self.assertEqual(spotify.remote_sample({"item": None})["status"], "unknown")
+        self.assertEqual(spotify.remote_sample(None)["status"], "idle")
 
     def test_token_storage_and_refresh(self):
         with TemporaryDirectory() as folder, patch.object(
@@ -225,9 +213,9 @@ class SpotifyTests(unittest.TestCase):
             with patch.object(spotify, "request_json", side_effect=[
                 HTTPError("", 401, "", {}, io.BytesIO()),
                 {"access_token": "new", "expires_in": 3600},
-                {},
+                None,
             ]) as request:
-                self.assertEqual(spotify.account_operation(CLIENT_ID, "status", ()), {"status": "idle", "extended": False})
+                self.assertEqual(spotify.account_operation(CLIENT_ID, "sample", ())["status"], "idle")
                 self.assertEqual(request.call_count, 3)
                 self.assertEqual(request.call_args_list[1].kwargs["form"]["client_id"], CLIENT_ID)
             self.assertEqual(spotify.load_tokens()["refresh_token"], saved["refresh_token"])
@@ -237,16 +225,16 @@ class SpotifyTests(unittest.TestCase):
         with TemporaryDirectory() as folder, patch.object(
             spotify, "TOKEN_FILE", Path(folder) / "tokens.json"
         ), patch.object(spotify, "request_json", side_effect=[
-            {"access_token": "new", "expires_in": 3600}, {},
+            {"access_token": "new", "expires_in": 3600}, None,
         ]) as request:
             spotify.TOKEN_FILE.write_text(json.dumps({
                 "access_token": "old", "refresh_token": "refresh", "expires_at": 2**40,
             }), encoding="utf-8")
-            self.assertEqual(spotify.account_operation(CLIENT_ID, "status", ()), {"status": "idle", "extended": False})
+            self.assertEqual(spotify.account_operation(CLIENT_ID, "sample", ())["status"], "idle")
             self.assertEqual(request.call_args_list[0].kwargs["form"]["client_id"], CLIENT_ID)
             self.assertEqual(spotify.load_tokens()["client_id"], CLIENT_ID)
             request.reset_mock()
-            self.assertEqual(spotify.account_operation("b" * 32, "status", ()), {"status": "disconnected"})
+            self.assertEqual(spotify.account_operation("b" * 32, "sample", ()), {"status": "disconnected"})
             request.assert_not_called()
 
     def test_backoff_and_disconnected_result(self):

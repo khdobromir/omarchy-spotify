@@ -99,8 +99,11 @@ int main(int argc, char *argv[]) {
                             && backend.playback().value("uri").toString() == incoming.uri);
         if (incoming.action == Action::OpenTrack)
             backend.openTrack(incoming.uri);
-        else
+        else {
+            if (incoming.action == Action::PlayTrack && backend.localMode())
+                backend.setLocalMode(false);
             backend.openUri(incoming.uri);
+        }
     };
     Instance instance;
     if (!instance.listen(socket, [window, &route](const Instance::Request &incoming) {

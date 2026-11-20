@@ -26,6 +26,7 @@ QByteArray readFile(const QString &path) {
 class BackendTest : public QObject {
     Q_OBJECT
 
+    QProcess m_core;
     QByteArray originalPath = qgetenv("PATH");
 
     bool configure(const QTemporaryDir &directory) {
@@ -34,21 +35,39 @@ class BackendTest : public QObject {
         const QString base = directory.path();
         qputenv("PATH", base.toUtf8() + ':' + originalPath);
         qputenv("XDG_STATE_HOME", base.toUtf8());
+        qputenv("XDG_RUNTIME_DIR", base.toUtf8());
         if (!QDir(base).mkdir("backend-test")
             || !writeFile(base + "/backend-test/soloist-key", "fixture")
             || !writeFile(base + "/events", {})
             || !writeFile(base + "/library-fixture", {}))
             return false;
         const QByteArray fixture = "#!" PYTHON_EXECUTABLE "\n" + readFile(FIXTURE_PATH);
-        for (const auto name : {"python3", "soloist"}) {
-            const auto path = base + '/' + name;
-            if (!writeFile(path, fixture) || !QFile::setPermissions(path, QFile::ReadOwner | QFile::ExeOwner))
-                return false;
-        }
-        return true;
+        const auto path = base + "/soloist";
+        if (!writeFile(path, fixture) || !QFile::setPermissions(path, QFile::ReadOwner | QFile::ExeOwner))
+            return false;
+        m_core.start(PYTHON_EXECUTABLE, {FIXTURE_PATH});
+        return m_core.waitForStarted();
     }
 
 private slots:
+    void cleanup() {
+        m_core.terminate();
+        if (!m_core.waitForFinished(1000)) {
+            m_core.kill();
+            m_core.waitForFinished();
+        }
+    }
+
+    void usesPhoneByDefault() {
+        QTemporaryDir directory;
+        QVERIFY(configure(directory));
+        Backend backend;
+        QTRY_COMPARE(backend.playback().value("device").toString(), "Phone");
+        backend.togglePlayback();
+        QTRY_VERIFY(readFile(directory.filePath("played")).contains("[\"pause\", null, \"phone\"]"));
+        QVERIFY(!QFile::exists(directory.filePath("daemon")));
+    }
+
     void appendsAndRetriesWithoutReplacingRows() {
         QTemporaryDir directory;
         QVERIFY(configure(directory));
@@ -105,6 +124,7 @@ private slots:
         QTemporaryDir directory;
         QVERIFY(configure(directory));
         Backend backend;
+        backend.setLocalMode(true);
         const QString events = directory.filePath("events");
         const QString log = directory.filePath("web");
         const auto trackChanged = [&](char letter) {
@@ -138,6 +158,7 @@ private slots:
         QTemporaryDir directory;
         QVERIFY(configure(directory));
         Backend backend;
+        backend.setLocalMode(true);
         const QString events = directory.filePath("events");
         const QString commands = directory.filePath("played");
         QTRY_VERIFY(backend.playback().value("ready").toBool());

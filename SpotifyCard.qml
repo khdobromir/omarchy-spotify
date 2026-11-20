@@ -14,9 +14,10 @@ PopupCard {
   required property string spotifyIcon
   readonly property bool hasTrack: sample.status === "track"
   readonly property bool hasProgress: hasTrack && sample.duration > 0 && sample.progress !== null
-  readonly property bool signedIn: hasTrack || sample.status === "idle"
+  readonly property bool signedIn: sample.auth === "connected"
   readonly property bool extended: signedIn && sample.extended === true
-  readonly property bool controls: extended && hasTrack && !!sample.deviceId
+  readonly property bool controls: extended && sample.sync === "ok" && !!sample.deviceId
+    && sample.capabilities?.active && !sample.capabilities.restricted && !sample.capabilities.private
   readonly property bool ready: !!spotify?.available
   readonly property bool showingLibrary: extended && libraryOpen
   readonly property bool seekable: controls && hasProgress && allowed("seeking")
@@ -24,7 +25,7 @@ PopupCard {
   readonly property bool favoriteKnown: favorite.id === sample.trackId && typeof favorite.saved === "boolean"
   readonly property bool connecting: !!spotify?.busy && spotify.action === "connect"
   readonly property bool canConnect: ["loading", "setup_required", "disconnected", "auth_error", "auth_timeout", "browser_error", "denied"].includes(sample.status)
-  readonly property bool canRetry: sample.status === "forbidden" || sample.status === "unavailable"
+  readonly property bool canRetry: ["forbidden", "unavailable", "limited"].includes(sample.status)
   readonly property color textColor: Commons.Color.popups.text
   readonly property color secondaryColor: Qt.tint(textColor, Qt.alpha(Commons.Color.popups.background, 0.30))
   property bool libraryOpen: false
@@ -51,7 +52,7 @@ PopupCard {
   function seek(position) {
     if (root.ready && root.seekable)
       root.spotify.run("seek", [seekBar.dragDevice || root.sample.deviceId,
-        seekBar.dragTrack || root.sample.trackId, String(Math.round(position))])
+        seekBar.dragTrack || root.sample.uri, String(Math.round(position))])
   }
 
   onOpenChanged: {
@@ -88,7 +89,7 @@ PopupCard {
 
     Timer {
       interval: 1
-      running: root.open && !root.showingLibrary && root.hasTrack && root.extended
+      running: root.open && !root.showingLibrary && !!root.sample.trackId && root.extended
         && root.ready && !root.spotify?.busy && root.favoriteRequested !== root.sample.trackId
       onTriggered: {
         if (root.spotify?.run("favorite", [root.sample.trackId]))
@@ -215,7 +216,7 @@ PopupCard {
 
       onDraggingChanged: if (dragging) {
         dragDevice = root.sample.deviceId
-        dragTrack = root.sample.trackId
+        dragTrack = root.sample.uri
       }
       onVisibleChanged: if (!visible) {
         dragging = false
@@ -348,13 +349,13 @@ PopupCard {
 
       Button {
         iconText: root.spotifyIcon
-        text: root.hasTrack ? strings.t("openTrack") : strings.t("connect")
+        text: root.sample.trackId ? strings.t("openTrack") : strings.t("connect")
         foreground: root.textColor
         focusable: true
-        visible: root.hasTrack || root.canConnect
+        visible: !!root.sample.trackId || root.canConnect
         enabled: root.hasTrack ? !!root.spotify && !root.spotify.openingDesktop : root.ready
         onClicked: {
-          if (root.hasTrack)
+          if (root.sample.trackId)
             root.spotify.openDesktop("--open-track", "spotify:track:" + root.sample.trackId)
           else
             root.spotify.run("connect")
@@ -376,7 +377,7 @@ PopupCard {
         text: strings.t("disconnect")
         foreground: root.secondaryColor
         focusable: true
-        visible: !root.canConnect
+        visible: root.signedIn
         enabled: !!root.spotify && (!root.spotify.busy || root.ready)
         onClicked: root.spotify.run("disconnect")
       }

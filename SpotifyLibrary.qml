@@ -95,15 +95,13 @@ ColumnLayout {
       if (root.spotify)
         root.applyPage(root.spotify.library)
     }
-    function onSampleChanged() {
-      if (["authorized", "disconnected", "setup_required", "reauthorize"].includes(root.spotify?.sample.status)) {
-        root.contexts = {}
-        root.request = null
-        root.displayedCategory = ""
-        rows.clear()
-        if (root.browsing)
-          root.show(root.category)
-      }
+    function onLibraryInvalidated() {
+      root.contexts = {}
+      root.request = null
+      root.displayedCategory = ""
+      rows.clear()
+      if (root.browsing)
+        root.show(root.category)
     }
   }
 

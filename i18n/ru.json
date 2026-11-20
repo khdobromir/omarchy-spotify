@@ -46,5 +46,9 @@
   "desktop_failed": "Не удалось открыть плеер.",
   "openTrack": "Открыть трек",
   "libraryLoadingMore": "Загружаю ещё…",
-  "libraryMoreError": "Не удалось загрузить ещё."
+  "libraryMoreError": "Не удалось загрузить ещё.",
+  "core_unavailable": "Spotify Core недоступен. Переподключение…",
+  "private": "В Spotify открыта приватная сессия.",
+  "unknown": "Сведения о треке недоступны.",
+  "request_timeout": "Spotify Core занят. Повтори попытку."
 }

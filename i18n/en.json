@@ -46,5 +46,9 @@
   "desktop_failed": "Could not open the desktop player.",
   "openTrack": "Open track",
   "libraryLoadingMore": "Loading more…",
-  "libraryMoreError": "Could not load more."
+  "libraryMoreError": "Could not load more.",
+  "core_unavailable": "Spotify Core is unavailable. Reconnecting…",
+  "private": "Spotify is playing in a private session.",
+  "unknown": "Track details unavailable.",
+  "request_timeout": "Spotify Core is busy. Try again."
 }

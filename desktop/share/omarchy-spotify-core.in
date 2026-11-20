@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+bindir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+core="$bindir/../@CMAKE_INSTALL_DATADIR@/omarchy-spotify/spotify_core.py"
+if [ "${1:-}" = "--activate" ]; then
+    exec python3 -B "$core" --activate
+fi
+exec python3 -B "$core"

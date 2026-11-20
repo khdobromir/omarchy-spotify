@@ -9,10 +9,14 @@
 #include <QFileSystemWatcher>
 #include <QObject>
 #include <QProcess>
-#include <QTemporaryFile>
+#include <QLocalSocket>
+#include <QElapsedTimer>
 #include <QTimer>
 #include <QVariant>
 #include <QtQml/qqmlregistration.h>
+
+#include <chrono>
+#include <functional>
 
 class LibraryModel final : public QAbstractListModel {
 public:
@@ -33,6 +37,9 @@ class Backend : public QObject {
     QML_ELEMENT
     QML_UNCREATABLE("Provided by the application")
     Q_PROPERTY(QVariantMap playback READ playback NOTIFY playbackChanged)
+    Q_PROPERTY(QVariantList queue READ queue NOTIFY playerChanged)
+    Q_PROPERTY(QVariantList devices READ devices NOTIFY playerChanged)
+    Q_PROPERTY(bool localMode READ localMode NOTIFY playerChanged)
     Q_PROPERTY(int position READ position NOTIFY positionChanged)
     Q_PROPERTY(QString playerStatus READ playerStatus NOTIFY playerChanged)
     Q_PROPERTY(QAbstractItemModel *entries READ entries CONSTANT)
@@ -68,7 +75,10 @@ public:
     bool webBusy() const { return !m_web.operation.isEmpty(); }
     bool webCoolingDown() const { return !m_backoff.hasExpired(); }
     int favorite() const { return m_favorite; }
-    bool commandBusy() const { return m_control.state() != QProcess::NotRunning; }
+    bool commandBusy() const { return m_local ? m_control.state() != QProcess::NotRunning : m_remoteBusy; }
+    QVariantList queue() const { return m_queue; }
+    QVariantList devices() const { return m_devices; }
+    bool localMode() const { return m_local; }
     QString selectedUri() const { return m_selectedUri; }
     QVariantMap selection() const { return m_selection; }
     bool selectionLoading() const;
@@ -78,7 +88,16 @@ public:
     void openTrack(const QString &uri);
     Q_INVOKABLE void saveKey(const QString &key);
     Q_INVOKABLE void startPlayer();
-    Q_INVOKABLE void play(const QString &uri = {});
+    Q_INVOKABLE void play(const QString &uri = {}, int offset = -1);
+    Q_INVOKABLE void setLocalMode(bool enabled);
+    Q_INVOKABLE void refreshDevices();
+    Q_INVOKABLE void refreshQueue();
+    Q_INVOKABLE void setShuffle(bool state);
+    Q_INVOKABLE void setRepeat(const QString &state);
+    Q_INVOKABLE void setVolume(int volume);
+    Q_INVOKABLE void transfer(const QString &device);
+    Q_INVOKABLE void preferDevice(const QString &device);
+    Q_INVOKABLE void disconnectAccount();
     Q_INVOKABLE void togglePlayback();
     Q_INVOKABLE void skip(bool next);
     Q_INVOKABLE void seek(int position, const QString &uri);
@@ -114,11 +133,18 @@ private:
     };
 
     struct WebJob {
-        QProcess process;
+        QString id;
         QString operation;
         QStringList arguments;
     };
 
+    void connectCore();
+    void readCore();
+    void applySample(const QJsonObject &sample);
+    QString requestCore(const QString &method, const QJsonObject &params,
+                        std::function<void(const QJsonObject &)> done, std::chrono::milliseconds timeout = std::chrono::seconds(20));
+    void remoteCommand(const QString &method, QJsonObject params = {});
+    void clearAccount();
     void setPlayerStatus(const QString &status);
     void tryTrace();
     void readTrace();
@@ -158,7 +184,20 @@ private:
     QVariantMap m_selection;
     bool m_lookupSelection = false;
 
-    QTemporaryFile m_helper;
+    QLocalSocket m_core;
+    QTimer m_reconnect;
+    QElapsedTimer m_clock;
+    QHash<QString, std::function<void(const QJsonObject &)>> m_replies;
+    QJsonObject m_sample;
+    QVariantList m_devices;
+    QVariantList m_queue;
+    quint64 m_requestId = 0;
+    qint64 m_revision = -1;
+    qint64 m_accountRevision = -1;
+    int m_attempts = 0;
+    bool m_remoteBusy = false;
+    bool m_local = false;
+    bool m_coreReady = false;
     WebJob m_web;
     WebJob m_trackWeb;
     QDeadlineTimer m_backoff;

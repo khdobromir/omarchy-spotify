@@ -16,6 +16,7 @@ struct Playback {
     QUrl artHigh;
     int duration = 0;
 
+    void applyRemote(const QJsonObject &sample, qint64 now);
     bool apply(const QByteArray &line, qint64 now);
     bool mergeMetadata(const QJsonObject &track);
     bool needsMetadata() const;

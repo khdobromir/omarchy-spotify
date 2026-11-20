@@ -192,3 +192,24 @@ bool Playback::apply(const QByteArray &line, qint64 now) {
     }
     return true;
 }
+
+void Playback::applyRemote(const QJsonObject &sample, qint64 now) {
+    *this = {};
+    const auto capabilities = sample.value("capabilities").toObject();
+    loggedIn = sample.value("sync") == "ok" && capabilities.value("active").toBool()
+        && !capabilities.value("restricted").toBool() && !capabilities.value("private").toBool()
+        && sample.value("deviceId").isString();
+    const auto playing = sample.value("playing");
+    status = playing.isBool() ? (playing.toBool() ? "playing" : "paused") : "idle";
+    uri = sample.value("uri").toString();
+    title = sample.value("title").toString();
+    artist = sample.value("artist").toString();
+    album = sample.value("album").toString();
+    art = QUrl(sample.value("art").toString());
+    artHigh = QUrl(sample.value("artHigh").toString());
+    duration = (std::max)(0, sample.value("duration").toInt());
+    m_sampledAt = now;
+    m_speed = playing.toBool() && sample.value("progress").isDouble() ? 1 : 0;
+    const qint64 offset = m_speed > 0 ? std::clamp(sample.value("sampleAgeMs").toInteger(), qint64{0}, qint64{duration}) : 0;
+    m_position = int(std::clamp(sample.value("progress").toInteger() + offset, qint64{0}, qint64{duration}));
+}

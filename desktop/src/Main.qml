@@ -129,7 +129,7 @@ ApplicationWindow {
         if (showingGrid || showingLists)
             backend.openCollection(entry.uri, entry)
         else
-            backend.play(entry.uri)
+            backend.play(entry.uri, entry.offset ?? -1)
     }
 
     function timeText(ms: int): string {
@@ -139,7 +139,16 @@ ApplicationWindow {
 
     function playerMessage(status: string): string {
         switch (status) {
-        case "starting": return qsTr("Starting Spotify Soloist…")
+        case "starting": return window.backend.localMode ? qsTr("Starting Spotify Soloist…") : qsTr("Connecting to Spotify Core…")
+        case "core_unavailable": return qsTr("Spotify Core is unavailable. Reconnecting…")
+        case "no_device": return qsTr("No controllable Spotify Connect device. Choose a device to transfer playback.")
+        case "target_changed": return qsTr("The Spotify Connect device changed. Try again.")
+        case "action_forbidden": return qsTr("Spotify does not allow this action on the active device.")
+        case "action_failed":
+        case "unavailable": return qsTr("Spotify could not perform that action.")
+        case "limited":
+        case "quota":
+        case "forbidden": return window.libraryMessage(status)
         case "key_required": return qsTr("Add your personal Soloist API key.")
         case "key_write": return qsTr("Could not save the key on this computer.")
         case "pairing": return qsTr("In Spotify on your phone, select Omarchy Spotify from the device list.")
@@ -626,7 +635,7 @@ ApplicationWindow {
                                 if (window.backend.selectionStatus === "inspecting")
                                     return window.backend.selection.subtitle || ""
                                 if (window.backend.selectionStatus === "failed")
-                                    return qsTr("Soloist could not perform that action.")
+                                    return window.backend.localMode ? qsTr("Soloist could not perform that action.") : window.playerMessage(window.backend.playerStatus)
                                 if (window.backend.selectionStatus === "waiting" && window.track.ready)
                                     return qsTr("Waiting to start playback…")
                                 return window.playerMessage(window.backend.playerStatus)
@@ -720,6 +729,12 @@ ApplicationWindow {
                             text: window.track.artist || ""
                             visible: text !== ""
                         }
+                        PageLabel {
+                            text: window.track.device ? qsTr("Playing on %1").arg(window.track.device) : ""
+                            textFormat: Text.PlainText
+                            visible: text !== ""
+                            Layout.fillWidth: true
+                        }
                     }
                 }
 
@@ -740,6 +755,75 @@ ApplicationWindow {
                     Layout.minimumWidth: 70
                     spacing: 2
                     Item { Layout.fillWidth: true }
+                    Button {
+                        text: qsTr("Devices")
+                        onClicked: {
+                            window.backend.refreshDevices()
+                            devicesMenu.open()
+                        }
+                        Menu {
+                            id: devicesMenu
+                            y: -height
+                            Instantiator {
+                                model: window.backend.devices
+                                delegate: Menu {
+                                    id: deviceMenu
+                                    required property var modelData
+                                    title: (modelData.preferred ? "★ " : "") + modelData.name
+                                    enabled: !!modelData.id && !modelData.restricted
+                                    MenuItem {
+                                        text: qsTr("Transfer playback here")
+                                        enabled: !deviceMenu.modelData.active
+                                        onTriggered: window.backend.transfer(deviceMenu.modelData.id)
+                                    }
+                                    MenuItem {
+                                        text: qsTr("Mark as preferred")
+                                        onTriggered: window.backend.preferDevice(deviceMenu.modelData.id)
+                                    }
+                                }
+                                onObjectAdded: (index, menu) => devicesMenu.insertMenu(index, menu)
+                                onObjectRemoved: (index, menu) => devicesMenu.removeMenu(menu)
+                            }
+                            MenuSeparator {}
+                            MenuItem {
+                                text: qsTr("Shuffle")
+                                checkable: true
+                                checked: window.track.shuffle === true
+                                enabled: !window.backend.localMode && window.canPlay
+                                    && !(window.track.disallows ?? []).includes("toggling_shuffle")
+                                onTriggered: window.backend.setShuffle(!window.track.shuffle)
+                            }
+                            Menu {
+                                title: qsTr("Repeat")
+                                enabled: !window.backend.localMode && window.canPlay
+                                MenuItem { text: qsTr("Off"); onTriggered: window.backend.setRepeat("off") }
+                                MenuItem { text: qsTr("Collection"); onTriggered: window.backend.setRepeat("context") }
+                                MenuItem { text: qsTr("Track"); onTriggered: window.backend.setRepeat("track") }
+                            }
+                            MenuItem {
+                                text: qsTr("Volume")
+                                enabled: window.track.supportsVolume === true && window.canPlay
+                                onTriggered: volumeDialog.open()
+                            }
+                            MenuItem {
+                                text: qsTr("Queue")
+                                enabled: !window.backend.localMode && window.track.ready
+                                onTriggered: {
+                                    window.backend.refreshQueue()
+                                    queueDialog.open()
+                                }
+                            }
+                            MenuSeparator {}
+                            MenuItem {
+                                text: window.backend.localMode ? qsTr("Remote Playback") : qsTr("Local Playback")
+                                onTriggered: window.backend.setLocalMode(!window.backend.localMode)
+                            }
+                            MenuItem {
+                                text: qsTr("Disconnect Spotify")
+                                onTriggered: window.backend.disconnectAccount()
+                            }
+                        }
+                    }
                     RowButton {
                         glyph: window.backend.favorite === 1 ? "saved" : "add"
                         text: window.backend.favorite === 1 ? qsTr("Remove from Liked Songs") : qsTr("Save to Liked Songs")
@@ -752,6 +836,40 @@ ApplicationWindow {
                         onClicked: window.nowPlayingExpanded = true
                     }
                 }
+            }
+        }
+    }
+
+    Dialog {
+        id: volumeDialog
+        anchors.centerIn: parent
+        title: qsTr("Volume")
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        onAboutToShow: volumeSlider.value = window.track.volume ?? 0
+        onAccepted: window.backend.setVolume(Math.round(volumeSlider.value))
+        Slider {
+            id: volumeSlider
+            from: 0
+            to: 100
+            stepSize: 1
+            Accessible.name: qsTr("Volume")
+        }
+    }
+
+    Dialog {
+        id: queueDialog
+        anchors.centerIn: parent
+        title: qsTr("Queue")
+        standardButtons: Dialog.Close
+        ListView {
+            implicitWidth: Math.min(window.width - 60, 340)
+            implicitHeight: Math.min(window.height / 2, 300)
+            clip: true
+            model: window.backend.queue
+            delegate: ItemDelegate {
+                required property var modelData
+                width: ListView.view.width
+                text: modelData.title
             }
         }
     }

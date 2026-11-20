@@ -1,5 +1,6 @@
 """Fake Soloist and Spotify helper, selected by executable name."""
 
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -46,8 +47,7 @@ def soloist():
         log("played", args[1:-2])
 
 
-def web():
-    operation, *parameters = args[2:]
+def web(operation, *parameters):
     log("web", [operation, *parameters])
     if operation in ("track", "episode"):
         identity = parameters[0]
@@ -82,7 +82,38 @@ def web():
             "next": 20 if offset == "0" else None}
 
 
-if Path(sys.argv[0]).name == "soloist":
-    soloist()
-else:
-    print(json.dumps(web()))
+
+async def core():
+    async def handle(reader, writer):
+        try:
+            while line := await reader.readline():
+                message = json.loads(line)
+                method = message["method"]
+                params = message["params"]
+                if method == "subscribe":
+                    result = {"status": "track", "auth": "connected", "sync": "ok", "revision": 1,
+                              "accountRevision": 0, "deviceId": "phone", "device": "Phone",
+                              "capabilities": {"active": True}, "playing": True,
+                              "uri": "spotify:track:" + "t" * 22}
+                elif method.startswith("playback."):
+                    log("played", [method.split(".")[1], params.get("uri"), params.get("deviceId")])
+                    result = {"accepted": True}
+                else:
+                    result = await asyncio.to_thread(web, method, *params.get("args", []))
+                writer.write((json.dumps({"version": 1, "id": message["id"], "ok": True,
+                                          "result": result}) + "\n").encode())
+                await writer.drain()
+        finally:
+            writer.close()
+
+    path = Path(os.environ["XDG_RUNTIME_DIR"]) / "omarchy-spotify/core.sock"
+    path.parent.mkdir(mode=0o700, exist_ok=True)
+    async with await asyncio.start_unix_server(handle, path) as server:
+        await server.serve_forever()
+
+
+if __name__ == "__main__":
+    if Path(sys.argv[0]).name == "soloist":
+        soloist()
+    else:
+        asyncio.run(core())

@@ -32,7 +32,7 @@ ColumnLayout {
             text: qsTr("Previous track")
             foreground: transport.foreground
             emphasis: transport.accent
-            enabled: transport.ready
+            enabled: transport.ready && !(transport.track.disallows ?? []).includes("skipping_prev")
             onClicked: transport.backend.skip(false)
         }
         MediaButton {
@@ -42,8 +42,8 @@ ColumnLayout {
             foreground: transport.foreground
             emphasis: transport.accent
             emphasisText: transport.accentForeground
-            enabled: transport.ready
             primary: true
+            enabled: transport.ready && !(transport.track.disallows ?? []).includes(transport.track.playing ? "pausing" : "resuming")
             onClicked: transport.backend.togglePlayback()
         }
         MediaButton {
@@ -51,7 +51,7 @@ ColumnLayout {
             text: qsTr("Next track")
             foreground: transport.foreground
             emphasis: transport.accent
-            enabled: transport.ready
+            enabled: transport.ready && !(transport.track.disallows ?? []).includes("skipping_next")
             onClicked: transport.backend.skip(true)
         }
     }
@@ -75,7 +75,7 @@ ColumnLayout {
             leftPadding: 0
             rightPadding: 0
             to: Math.max(1, transport.track.duration)
-            enabled: transport.track.ready && transport.track.duration > 0 && (!transport.backend.commandBusy || pressed)
+            enabled: transport.track.ready && !(transport.track.disallows ?? []).includes("seeking") && transport.track.duration > 0 && (!transport.backend.commandBusy || pressed)
             Accessible.name: qsTr("Playback position")
             Binding on value {
                 when: !seek.pressed
