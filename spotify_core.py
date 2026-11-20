@@ -374,7 +374,8 @@ async def serve(core, path=None, listener=None):
         server = await asyncio.start_unix_server(core.client, path, limit=LIMIT)
         os.chmod(path, 0o600)
     else:
-        server = await asyncio.start_unix_server(core.client, sock=listener, limit=LIMIT)
+        # systemd owns the pathname across service restarts.
+        server = await asyncio.start_unix_server(core.client, sock=listener, limit=LIMIT, cleanup_socket=False)
     core.poller = asyncio.create_task(core.poll())
     return server
 

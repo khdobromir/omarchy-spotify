@@ -1,5 +1,6 @@
 import asyncio
 import json
+import socket
 import tempfile
 import time
 import unittest
@@ -141,3 +142,15 @@ class CoreTest(unittest.IsolatedAsyncioTestCase):
                     sender.close()
                     receiver.close()
                     await core.close()
+
+    async def test_inherited_socket_path_survives_core_shutdown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "core.sock"
+            with socket.socket(socket.AF_UNIX) as manager:
+                manager.bind(str(path))
+                manager.listen()
+                core = Core()
+                server = await serve(core, listener=manager.dup())
+                async with server:
+                    await core.close()
+                self.assertTrue(path.is_socket())

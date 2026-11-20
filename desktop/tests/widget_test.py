@@ -12,7 +12,8 @@ ROOT = Path(__file__).resolve().parents[2]
 with TemporaryDirectory(prefix="spotify-widget-") as directory:
     config = Path(directory)
     env = dict(os.environ, XDG_RUNTIME_DIR=directory, XDG_CONFIG_HOME=directory,
-               XDG_STATE_HOME=directory, XDG_CACHE_HOME=directory, QT_QPA_PLATFORM="offscreen")
+               XDG_STATE_HOME=directory, XDG_CACHE_HOME=directory, QT_QPA_PLATFORM="offscreen",
+               PATH=os.defpath)
     shutil.copy(ROOT / "Service.qml", config)
     (config / "shell.qml").write_text("""
 import QtQuick
@@ -38,24 +39,46 @@ ShellRoot {
         }
     }
     Timer {
-        interval: 2000
+        interval: 6500
         running: true
         onTriggered: Qt.quit()
     }
 }
 """)
-    fixture = subprocess.Popen([sys.executable, str(Path(__file__).with_name("fixture.py"))], env=env)
-    try:
-        for _ in range(200):
-            if (config / "omarchy-spotify/core.sock").exists():
-                break
+    endpoint = config / "omarchy-spotify/core.sock"
+    log = config / "played"
+
+    def start_core():
+        return subprocess.Popen([sys.executable, str(Path(__file__).with_name("fixture.py"))], env=env)
+
+    def wait_for(path):
+        for _ in range(250):
+            if path.exists() and (path == endpoint or path.stat().st_size):
+                return
             time.sleep(0.01)
-        result = subprocess.run([sys.argv[1], "-p", directory], env=env, capture_output=True,
-                                text=True, timeout=12)
-        log = config / "played"
-        assert result.returncode == 0 and log.exists(), result.stdout + result.stderr
-        assert [json.loads(line) for line in log.read_text().splitlines()] == [["pause", None, "phone"]]
-        assert not (config / "omarchy-spotify.lock").exists()
-    finally:
+        raise AssertionError(f"Missing {path.name}")
+
+    fixture = start_core()
+    widget = None
+    try:
+        wait_for(endpoint)
+        widget = subprocess.Popen([sys.argv[1], "-p", directory], env=env, stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT, text=True)
+        wait_for(log)
         fixture.terminate()
         fixture.wait(timeout=3)
+        endpoint.unlink()
+        time.sleep(1.5)
+        fixture = start_core()
+        output, _ = widget.communicate(timeout=12)
+        assert widget.returncode == 0, output
+        commands = [json.loads(line) for line in log.read_text().splitlines()]
+        assert commands == [["pause", None, "phone"], ["pause", None, "phone"]], (commands, output)
+        assert not (config / "omarchy-spotify.lock").exists()
+    finally:
+        if widget is not None and widget.poll() is None:
+            widget.kill()
+            widget.communicate()
+        if fixture.poll() is None:
+            fixture.terminate()
+            fixture.wait(timeout=3)

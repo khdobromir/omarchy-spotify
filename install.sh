@@ -60,6 +60,10 @@ if systemctl --user show-environment >/dev/null 2>&1; then
     if systemctl --user is-active --quiet omarchy-spotify.service; then
         systemctl --user restart omarchy-spotify.service
     fi
+    if [[ -n ${XDG_RUNTIME_DIR:-} && ! -S $XDG_RUNTIME_DIR/omarchy-spotify/core.sock ]] &&
+        systemctl --user is-active --quiet omarchy-spotify.socket; then
+        systemctl --user restart omarchy-spotify.socket
+    fi
     systemctl --user enable --now omarchy-spotify.socket
 fi
 
